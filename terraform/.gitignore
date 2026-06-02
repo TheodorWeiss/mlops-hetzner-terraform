@@ -1,0 +1,25 @@
+﻿# Terraform local files
+.terraform/
+
+# Terraform state - never commit this
+*.tfstate
+*.tfstate.*
+
+# Local variable files with secrets
+*.tfvars
+!*.tfvars.example
+
+# Local environment files / secrets
+.env
+*.env
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+
+# OS / editor temporary files
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+.vscode/

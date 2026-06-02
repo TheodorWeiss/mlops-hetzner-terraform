@@ -1,0 +1,117 @@
+﻿#cloud-config
+package_update: true
+package_upgrade: true
+
+users:
+  - name: deploy
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+ssh_pwauth: false
+disable_root: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - docker.io
+  - docker-compose-v2
+  - rsync
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-mlops-hardening.conf
+    permissions: '0644'
+    owner: root:root
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+
+  - path: /usr/local/bin/setup-mlops-volume.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      VOLUME_ID="${volume_id}"
+      DEVICE="/dev/disk/by-id/scsi-0HC_Volume_$VOLUME_ID"
+      MOUNT_POINT="/mnt/mlops-data"
+
+      echo "Waiting for Hetzner volume device: $DEVICE"
+
+      for i in $(seq 1 120); do
+        if [ -e "$DEVICE" ]; then
+          echo "Volume device found: $DEVICE"
+          break
+        fi
+
+        echo "Volume device not found yet, attempt $i/120..."
+        sleep 5
+      done
+
+      if [ ! -e "$DEVICE" ]; then
+        echo "ERROR: Volume device was not found after waiting."
+        exit 1
+      fi
+
+      mkdir -p "$MOUNT_POINT"
+
+      if blkid "$DEVICE"; then
+        echo "Volume already has a filesystem. Skipping format."
+      else
+        echo "No filesystem found on volume. Creating ext4 filesystem."
+        mkfs.ext4 -F "$DEVICE"
+      fi
+
+      UUID=$(blkid -s UUID -o value "$DEVICE")
+
+      if ! grep -q "$UUID" /etc/fstab; then
+        echo "Adding volume to /etc/fstab."
+        echo "UUID=$UUID $MOUNT_POINT ext4 defaults,nofail 0 2" >> /etc/fstab
+      else
+        echo "Volume already present in /etc/fstab."
+      fi
+
+      mount -a
+
+      mkdir -p "$MOUNT_POINT/postgres"
+      mkdir -p "$MOUNT_POINT/minio"
+      mkdir -p "$MOUNT_POINT/mlflow"
+      mkdir -p "$MOUNT_POINT/airflow"
+      mkdir -p "$MOUNT_POINT/feast"
+      mkdir -p "$MOUNT_POINT/prometheus"
+      mkdir -p "$MOUNT_POINT/grafana"
+      mkdir -p "$MOUNT_POINT/processed-data"
+      mkdir -p "$MOUNT_POINT/incoming-raw"
+
+      chown -R deploy:deploy "$MOUNT_POINT"
+
+      echo "Volume setup completed."
+      df -h "$MOUNT_POINT"
+
+runcmd:
+  - systemctl enable docker
+  - systemctl start docker
+  - usermod -aG docker deploy
+
+  - fallocate -l 4G /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+  - systemctl restart ssh
+
+  - /usr/local/bin/setup-mlops-volume.sh
+
+  - docker --version > /root/cloud-init-checks.txt
+  - docker compose version >> /root/cloud-init-checks.txt
+  - swapon --show >> /root/cloud-init-checks.txt
+  - df -h /mnt/mlops-data >> /root/cloud-init-checks.txt
+  - cp /root/cloud-init-checks.txt /home/deploy/cloud-init-checks.txt
+  - chown deploy:deploy /home/deploy/cloud-init-checks.txt

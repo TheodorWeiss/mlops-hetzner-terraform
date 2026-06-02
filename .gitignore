@@ -1,0 +1,22 @@
+﻿# Jupyter
+.ipynb_checkpoints/
+
+# Local data
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local env/secrets
+.env
+*.env
+
+# Logs/temp
+*.log
+*.tmp
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/

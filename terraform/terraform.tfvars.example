@@ -1,0 +1,8 @@
+﻿# Copy this file to terraform.tfvars and fill real values.
+# Do NOT commit terraform.tfvars.
+
+hcloud_token        = "paste_your_hetzner_cloud_api_token_here"
+ssh_public_key_path = "C:/Users/Theodor/.ssh/id_ed25519.pub"
+allowed_ssh_ip      = "YOUR_PUBLIC_IP/32"
+location            = "nbg1"
+server_name         = "mlops-exam-cx32"
