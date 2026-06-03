@@ -39,4 +39,14 @@ with DAG(
         execution_timeout=timedelta(minutes=3),
     )
 
-    sync_gbfs_raw >> check_upstream_freshness
+    parse_station_information = BashOperator(
+        task_id="parse_station_information",
+        bash_command="python /opt/airflow/scripts/parse_station_information.py",
+    )
+
+    parse_station_status = BashOperator(
+        task_id="parse_station_status",
+        bash_command="python /opt/airflow/scripts/parse_station_status.py",
+    )
+
+    sync_gbfs_raw >> check_upstream_freshness >> parse_station_information >> parse_station_status
