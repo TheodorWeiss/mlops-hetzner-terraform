@@ -1,0 +1,159 @@
+%%{init: {
+  "theme": "base",
+  "flowchart": {
+    "htmlLabels": true,
+    "curve": "basis",
+    "padding": 18
+  },
+  "themeVariables": {
+    "background": "#ffffff",
+    "primaryTextColor": "#111827",
+    "primaryBorderColor": "#334155",
+    "lineColor": "#475569",
+    "fontFamily": "Inter, Segoe UI, Arial, sans-serif",
+    "fontSize": "15px",
+    "clusterBkg": "#f8fafc",
+    "clusterBorder": "#64748b",
+    "edgeLabelBackground": "#ffffff",
+    "tertiaryColor": "#ffffff"
+  }
+}}%%
+flowchart TB
+    %% ===== External data sources =====
+    GBFS["Citi Bike GBFS API<br/>station_status / station_information"]
+    CSV["Historical Trip CSV<br/>S3 tripdata (monthly)"]
+    WX["Weather API"]
+    CAL["Holiday calendar"]
+
+    %% ===== Persistent Raw Ingestion Server =====
+    subgraph INGEST["Persistent Raw Ingestion Server — existing, non-Terraform"]
+        TIMER["systemd timer ~5 min"]
+        COLL["one-shot collector container"]
+        RAW[("raw json.gz snapshots<br/>+ latest + collector_status.json")]
+        WD["watchdog (freshness)"]
+        TG["Telegram alerts"]
+        TIMER --> COLL
+        COLL --> RAW
+        RAW -. freshness check .-> WD
+        COLL -. error alert .-> TG
+        WD -. freshness alert .-> TG
+    end
+
+    GBFS --> COLL
+
+    %% ===== MLOps Server (Terraform-managed) =====
+    subgraph MLOPS["MLOps Server — Terraform-managed, Hetzner CX33"]
+        direction TB
+
+        subgraph PIPE["Orchestration & Data Quality"]
+            AIRFLOW["Airflow DAGs<br/>ingest / features / train / eval / promote"]
+            GX["Great Expectations<br/>data quality"]
+            MAP["station_id_mapping<br/>short_name to station_id"]
+        end
+
+        subgraph STORE["Storage"]
+            PG[("PostgreSQL<br/>metadata / logs / feature tables")]
+            MINIO[("MinIO<br/>raw / parquet / models / reports")]
+        end
+
+        subgraph FEAT["Feature Store"]
+            FEAST["Feast + Postgres feature tables"]
+        end
+
+        subgraph MLP["ML Platform"]
+            MLFLOW["MLflow<br/>tracking + model registry"]
+            CHAMP["LightGBM champion"]
+            CHAL["XGBoost challenger"]
+        end
+
+        subgraph SERVE["Serving"]
+            API["FastAPI<br/>/predict/station · /predict/batch · /health"]
+            NGINX["Nginx"]
+        end
+
+        subgraph MON["Monitoring"]
+            PROM["Prometheus"]
+            GRAF["Grafana"]
+            EVID["Evidently<br/>drift / quality reports"]
+        end
+    end
+
+    %% ===== External tooling =====
+    GH["GitHub Actions — CI/CD"]
+    SUP["Superset — BI (stretch)"]
+
+    %% ===== Data flows into MLOps =====
+    RAW -->|rsync / Airflow SSH| AIRFLOW
+    CSV --> AIRFLOW
+    WX --> AIRFLOW
+    CAL --> AIRFLOW
+
+    AIRFLOW --> GX
+    AIRFLOW --> MAP
+    GX -. validates .-> MAP
+    MAP --> PG
+    AIRFLOW --> MINIO
+    PG --> FEAST
+    MINIO --> FEAST
+
+    %% ===== Training & promotion =====
+    FEAST --> AIRFLOW
+    AIRFLOW --> CHAMP
+    AIRFLOW --> CHAL
+    CHAMP --> MLFLOW
+    CHAL --> MLFLOW
+    MLFLOW -->|quality gate: promote / rollback| API
+
+    %% ===== Serving =====
+    USER["Operator / client"] --> NGINX
+    NGINX --> API
+    FEAST --> API
+    API -->|predictions| PG
+
+    %% ===== Monitoring & feedback loop =====
+    API --> PROM
+    AIRFLOW --> PROM
+    PROM --> GRAF
+    PG --> GRAF
+    AIRFLOW --> EVID
+    EVID --> MINIO
+    RAW -. future snapshots as labels .-> AIRFLOW
+    GRAF -. degradation alert .-> AIRFLOW
+
+    %% ===== CI/CD & BI =====
+    GH -->|deploy| MLOPS
+    PG -. analytics .-> SUP
+
+    %% ===== Colors =====
+    classDef source fill:#dbeafe,stroke:#2563eb,color:#111827,stroke-width:1.5px;
+    classDef ingest fill:#dcfce7,stroke:#16a34a,color:#111827,stroke-width:1.5px;
+    classDef orchestration fill:#ede9fe,stroke:#7c3aed,color:#111827,stroke-width:1.5px;
+    classDef storage fill:#ffedd5,stroke:#ea580c,color:#111827,stroke-width:1.5px;
+    classDef feature fill:#ccfbf1,stroke:#0f766e,color:#111827,stroke-width:1.5px;
+    classDef ml fill:#fce7f3,stroke:#db2777,color:#111827,stroke-width:1.5px;
+    classDef serving fill:#fef3c7,stroke:#d97706,color:#111827,stroke-width:1.5px;
+    classDef monitoring fill:#e0f2fe,stroke:#0284c7,color:#111827,stroke-width:1.5px;
+    classDef tool fill:#f1f5f9,stroke:#475569,color:#111827,stroke-width:1.5px;
+    classDef stretch fill:#f8fafc,stroke:#64748b,color:#334155,stroke-dasharray:6 4,opacity:0.9;
+
+    class GBFS,CSV,WX,CAL source;
+    class USER tool;
+    class TIMER,COLL,RAW,WD,TG ingest;
+    class AIRFLOW,GX,MAP orchestration;
+    class PG,MINIO storage;
+    class FEAST feature;
+    class MLFLOW,CHAMP,CHAL ml;
+    class API,NGINX serving;
+    class PROM,GRAF,EVID monitoring;
+    class GH tool;
+    class SUP stretch;
+
+    %% ===== Subgraph backgrounds =====
+    style INGEST fill:#f0fdf4,stroke:#16a34a,stroke-width:2px,color:#111827
+    style MLOPS fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#111827
+    style PIPE fill:#f5f3ff,stroke:#7c3aed,stroke-width:1.5px,color:#111827
+    style STORE fill:#fff7ed,stroke:#ea580c,stroke-width:1.5px,color:#111827
+    style FEAT fill:#f0fdfa,stroke:#0f766e,stroke-width:1.5px,color:#111827
+    style MLP fill:#fdf2f8,stroke:#db2777,stroke-width:1.5px,color:#111827
+    style SERVE fill:#fffbeb,stroke:#d97706,stroke-width:1.5px,color:#111827
+    style MON fill:#f0f9ff,stroke:#0284c7,stroke-width:1.5px,color:#111827

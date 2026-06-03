@@ -1,22 +1,31 @@
-﻿# Jupyter
-.ipynb_checkpoints/
+# Secrets
+.env
+*.pem
+*.key
+id_rsa*
+*.ppk
 
-# Local data
-data/
-
-# Python cache
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
 
-# Local env/secrets
-.env
-*.env
+# Airflow local files
+airflow/logs/
+airflow/plugins/
+airflow/airflow.cfg
 
-# Logs/temp
-*.log
-*.tmp
+# Local data / temp
+data/
+tmp/
+*.parquet
+*.csv
+*.json.gz
 
-# OS/editor
+# OS / IDE
 .DS_Store
-Thumbs.db
 .vscode/
+.idea/
+
+.ipynb_checkpoints/

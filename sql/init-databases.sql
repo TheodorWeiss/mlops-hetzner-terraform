@@ -1,0 +1,3 @@
+CREATE DATABASE airflow;
+CREATE DATABASE mlflow;
+CREATE DATABASE bikeml;
