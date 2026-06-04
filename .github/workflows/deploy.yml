@@ -5,7 +5,8 @@ on:
 
 jobs:
   deploy:
-    runs-on: self-hosted          # ← ключевое изменение: выполняется на сервере
+    runs-on: self-hosted
+
     steps:
       - name: checkout repository
         uses: actions/checkout@v4
@@ -14,8 +15,15 @@ jobs:
         run: |
           set -e
           rsync -a \
-            api airflow scripts sql docker-compose.yml \
+            api airflow scripts sql monitoring docker-compose.yml \
             /home/deploy/mlops-stack/
+
+      - name: prepare monitoring data directories
+        run: |
+          set -e
+          sudo mkdir -p /mnt/mlops-data/prometheus /mnt/mlops-data/grafana
+          sudo chown -R 65534:65534 /mnt/mlops-data/prometheus
+          sudo chown -R 472:472 /mnt/mlops-data/grafana
 
       - name: validate
         run: |
@@ -24,13 +32,46 @@ jobs:
           python3 -m py_compile api/app/main.py
           python3 -m py_compile scripts/*.py
           python3 -m py_compile airflow/dags/*.py
+          test -f monitoring/prometheus/prometheus.yml
+          test -f monitoring/blackbox/blackbox.yml
+          test -f monitoring/grafana/provisioning/datasources/prometheus.yml
           docker compose -p bikeml config > /dev/null
 
-      - name: restart code services
+      - name: build code images
         run: |
           set -e
           cd /home/deploy/mlops-stack
-          docker compose -p bikeml up -d api airflow-webserver airflow-scheduler
-          sleep 10
+          docker compose -p bikeml build api airflow-init airflow-webserver airflow-scheduler
+
+      - name: restart services
+        run: |
+          set -e
+          cd /home/deploy/mlops-stack
+          docker compose -p bikeml up -d \
+            api \
+            airflow-webserver \
+            airflow-scheduler \
+            prometheus \
+            grafana \
+            node-exporter \
+            cadvisor \
+            postgres-exporter \
+            blackbox-exporter
+
+          sleep 20
+
           curl --fail http://127.0.0.1:8000/health
-          docker compose -p bikeml ps api airflow-webserver airflow-scheduler
+          curl --fail http://127.0.0.1:8000/metrics
+          curl --fail http://127.0.0.1:9090/-/healthy
+          curl --fail http://127.0.0.1:3000/api/health
+
+          docker compose -p bikeml ps \
+            api \
+            airflow-webserver \
+            airflow-scheduler \
+            prometheus \
+            grafana \
+            node-exporter \
+            cadvisor \
+            postgres-exporter \
+            blackbox-exporter
