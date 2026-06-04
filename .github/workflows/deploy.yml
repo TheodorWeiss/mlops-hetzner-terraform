@@ -5,78 +5,32 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
-
-    env:
-      MLOPS_HOST: 128.140.1.182
-      MLOPS_USER: deploy
-      MLOPS_PORT: 22
-
+    runs-on: self-hosted          # ← ключевое изменение: выполняется на сервере
     steps:
       - name: checkout repository
         uses: actions/checkout@v4
 
-      - name: setup ssh key
+      - name: sync code into runtime folder
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.MLOPS_SECRETS }}" > ~/.ssh/mlops_deploy_key
-          chmod 600 ~/.ssh/mlops_deploy_key
-          ssh-keyscan -p "$MLOPS_PORT" "$MLOPS_HOST" >> ~/.ssh/known_hosts
+          set -e
+          rsync -a \
+            api airflow scripts sql docker-compose.yml \
+            /home/deploy/mlops-stack/
 
-      - name: prepare deploy bundle
+      - name: validate
         run: |
-          mkdir -p .deploy
-          cp -r api .deploy/
-          cp -r airflow .deploy/
-          cp -r scripts .deploy/
-          cp -r sql .deploy/
-          cp docker-compose.yml .deploy/
+          set -e
+          cd /home/deploy/mlops-stack
+          python3 -m py_compile api/app/main.py
+          python3 -m py_compile scripts/*.py
+          python3 -m py_compile airflow/dags/*.py
+          docker compose -p bikeml config > /dev/null
 
-      - name: backup current server files
+      - name: restart code services
         run: |
-          ssh -i ~/.ssh/mlops_deploy_key \
-            -p "$MLOPS_PORT" \
-            "$MLOPS_USER@$MLOPS_HOST" '
-              set -e
-              cd /home/deploy/mlops-stack
-              mkdir -p backups
-              tar \
-                --exclude="backups" \
-                --exclude="__pycache__" \
-                --exclude="*.pyc" \
-                --exclude=".env" \
-                --exclude="*.log" \
-                -czf "backups/mlops-stack-before-github-actions-$(date +%Y%m%d-%H%M%S).tar.gz" \
-                api airflow scripts sql docker-compose.yml || true
-            '
-
-      - name: rsync project files to server
-        run: |
-          rsync -az \
-            -e "ssh -i ~/.ssh/mlops_deploy_key -p $MLOPS_PORT" \
-            .deploy/ \
-            "$MLOPS_USER@$MLOPS_HOST:/home/deploy/mlops-stack/"
-
-      - name: validate and restart services
-        run: |
-          ssh -i ~/.ssh/mlops_deploy_key \
-            -p "$MLOPS_PORT" \
-            "$MLOPS_USER@$MLOPS_HOST" '
-              set -e
-              cd /home/deploy/mlops-stack
-
-              python3 -m py_compile api/app/main.py
-              python3 -m py_compile scripts/*.py
-              python3 -m py_compile airflow/dags/*.py
-
-              docker compose -p bikeml config > /tmp/bikeml-compose-from-github-actions.yml
-
-              docker compose -p bikeml build api airflow-init airflow-webserver airflow-scheduler
-
-              docker compose -p bikeml up -d api airflow-webserver airflow-scheduler
-
-              sleep 10
-
-              curl --fail http://127.0.0.1:8000/health
-              docker compose -p bikeml ps api airflow-webserver airflow-scheduler
-            '
+          set -e
+          cd /home/deploy/mlops-stack
+          docker compose -p bikeml up -d api airflow-webserver airflow-scheduler
+          sleep 10
+          curl --fail http://127.0.0.1:8000/health
+          docker compose -p bikeml ps api airflow-webserver airflow-scheduler
