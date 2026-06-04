@@ -1,0 +1,80 @@
+name: bikeml ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: create ci env file
+        run: |
+          cat > .env <<'EOF'
+          POSTGRES_USER=bikeml_admin
+          POSTGRES_PASSWORD=bikeml_password
+          POSTGRES_DB=postgres
+          AIRFLOW_DB=airflow
+          MLFLOW_DB=mlflow
+          BIKEML_DB=bikeml
+
+          POSTGRES_DATA_DIR=/tmp/bikeml/postgres
+          MINIO_DATA_DIR=/tmp/bikeml/minio
+          AIRFLOW_DATA_DIR=/tmp/bikeml/airflow
+          INCOMING_RAW_DIR=/tmp/bikeml/incoming-raw
+          PROCESSED_DATA_DIR=/tmp/bikeml/processed-data
+
+          MINIO_ROOT_USER=minioadmin
+          MINIO_ROOT_PASSWORD=minioadmin
+          MINIO_BUCKET_RAW=bikeml-raw
+          MINIO_BUCKET_PROCESSED=bikeml-processed
+          MINIO_BUCKET_MODELS=bikeml-models
+          MINIO_BUCKET_REPORTS=bikeml-reports
+
+          MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+          MLFLOW_ARTIFACT_BUCKET=bikeml-models
+          AWS_ACCESS_KEY_ID=minioadmin
+          AWS_SECRET_ACCESS_KEY=minioadmin
+
+          AIRFLOW_ADMIN_USER=admin
+          AIRFLOW_ADMIN_PASSWORD=admin
+          AIRFLOW_ADMIN_EMAIL=admin@example.com
+
+          INGESTION_SSH_HOST=example.com
+          INGESTION_SSH_USER=bikeml_ro
+          INGESTION_RAW_PATH=/srv/bikeml/raw/gbfs
+          INGESTION_SSH_KEY_PATH=/opt/airflow/.ssh/bikeml_ingestion_read
+          UPSTREAM_FRESHNESS_MAX_AGE_MINUTES=30
+          EOF
+
+      - name: check python syntax
+        run: |
+          python -m py_compile scripts/*.py
+          python -m py_compile api/app/main.py
+          python -m py_compile airflow/dags/*.py
+
+      - name: validate docker compose config
+        run: |
+          docker compose -p bikeml config > /tmp/bikeml-compose.yml
+
+      - name: check required project files
+        run: |
+          test -f README.md
+          test -f MANIFEST.md
+          test -f reports/sli_slo.md
+          test -f adr/ADR-001-latency-serving-path.md
+          test -f api/Dockerfile
+          test -f api/app/main.py
+          test -f airflow/dags/gbfs_ingestion_dag.py
+          test -f airflow/dags/monthly_tripdata_ingestion_dag.py
