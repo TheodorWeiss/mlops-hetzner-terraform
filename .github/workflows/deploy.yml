@@ -7,6 +7,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
+    env:
+      MLOPS_HOST: 128.140.1.182
+      MLOPS_USER: deploy
+      MLOPS_PORT: 22
+
     steps:
       - name: checkout repository
         uses: actions/checkout@v4
@@ -14,9 +19,9 @@ jobs:
       - name: setup ssh key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.MLOPS_SECRETS }}" > ~/.ssh/mlops_deploy_key
+          printf '%s\n' "${{ secrets.MLOPS_SECRETS }}" > ~/.ssh/mlops_deploy_key
           chmod 600 ~/.ssh/mlops_deploy_key
-          ssh-keyscan -p "${{ secrets.MLOPS_PORT }}" "${{ secrets.MLOPS_HOST }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -p "$MLOPS_PORT" "$MLOPS_HOST" >> ~/.ssh/known_hosts
 
       - name: prepare deploy bundle
         run: |
@@ -30,8 +35,8 @@ jobs:
       - name: backup current server files
         run: |
           ssh -i ~/.ssh/mlops_deploy_key \
-            -p "${{ secrets.MLOPS_PORT }}" \
-            "${{ secrets.MLOPS_USER }}@${{ secrets.MLOPS_HOST }}" '
+            -p "$MLOPS_PORT" \
+            "$MLOPS_USER@$MLOPS_HOST" '
               set -e
               cd /home/deploy/mlops-stack
               mkdir -p backups
@@ -48,15 +53,15 @@ jobs:
       - name: rsync project files to server
         run: |
           rsync -az \
-            -e "ssh -i ~/.ssh/mlops_deploy_key -p ${{ secrets.MLOPS_PORT }}" \
+            -e "ssh -i ~/.ssh/mlops_deploy_key -p $MLOPS_PORT" \
             .deploy/ \
-            "${{ secrets.MLOPS_USER }}@${{ secrets.MLOPS_HOST }}:/home/deploy/mlops-stack/"
+            "$MLOPS_USER@$MLOPS_HOST:/home/deploy/mlops-stack/"
 
       - name: validate and restart services
         run: |
           ssh -i ~/.ssh/mlops_deploy_key \
-            -p "${{ secrets.MLOPS_PORT }}" \
-            "${{ secrets.MLOPS_USER }}@${{ secrets.MLOPS_HOST }}" '
+            -p "$MLOPS_PORT" \
+            "$MLOPS_USER@$MLOPS_HOST" '
               set -e
               cd /home/deploy/mlops-stack
 
