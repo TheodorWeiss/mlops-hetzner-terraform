@@ -236,6 +236,43 @@ services:
     networks:
       - bikeml-net
 
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: bikeml-api:0.1.0
+    container_name: bikeml-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      BIKEML_DB: bikeml
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      LOW_AVAILABILITY_THRESHOLD: 1
+      STALE_STATE_SECONDS: 900
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - bikeml-net
+
 networks:
   bikeml-net:
     name: bikeml-net
