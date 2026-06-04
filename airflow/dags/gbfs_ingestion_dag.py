@@ -48,5 +48,11 @@ with DAG(
         task_id="parse_station_status",
         bash_command="python /opt/airflow/scripts/parse_station_status.py",
     )
+    
+    build_gbfs_online_features = BashOperator(
+        task_id="build_gbfs_online_features",
+        bash_command="python /opt/airflow/scripts/build_gbfs_online_features.py",
+        execution_timeout=timedelta(minutes=5),
+    )
+    sync_gbfs_raw >> check_upstream_freshness >> parse_station_information >> parse_station_status >> build_gbfs_online_features
 
-    sync_gbfs_raw >> check_upstream_freshness >> parse_station_information >> parse_station_status

@@ -1,29 +1,63 @@
-# BikeML MLOps Stack — Citi Bike Availability Risk Forecasting
+# BikeML MLOps Stack — Citi Bike Availability Forecasting
 
-Учебный MLOps-проект по прогнозу риска дефицита велосипедов и свободных доков в системе Citi Bike.
+Учебный MLOps-проект по прогнозу изменения доступности велосипедов на станциях Citi Bike на горизонте 1 час.
 
-Цель проекта — построить production-like ML-систему уровня зрелости 2: от сбора raw-данных и хранения в object storage до Airflow pipeline, feature engineering, обучения модели, model registry, serving API и мониторинга.
+MVP строит production-like ML-систему уровня зрелости 2: от сбора данных и feature engineering до Airflow pipeline, MLflow Model Registry, champion/candidate/challenger workflow, честного quality gate, serving API и мониторинга.
 
-Текущий статус: базовый MLOps-стек поднят на отдельном Hetzner Cloud сервере, а raw GBFS ingestion bridge успешно работает через Airflow DAG.
+Основная модель прогнозирует:
+
+```text
+delta_bikes_1h = returns_1h - departures_1h
+```
+
+На inference прогноз соединяется с текущим live-состоянием станции:
+
+```text
+predicted_bikes_1h = current_bikes_now + predicted_delta_bikes_1h
+predicted_bikes_1h = clip(predicted_bikes_1h, 0, capacity)
+```
+
+Поверх прогноза вычисляется производный сигнал:
+
+```text
+low_availability_risk = predicted_bikes_1h <= threshold
+```
 
 ---
 
-## 1. Архитектура серверов
+## 1. Цель проекта
+
+Цель проекта — показать полный жизненный цикл ML-системы:
+
+```text
+raw data
+→ ingestion
+→ structured tables
+→ feature engineering
+→ model training
+→ model evaluation
+→ MLflow registry
+→ champion/candidate/challenger
+→ quality gate
+→ serving
+→ monitoring
+→ monthly retraining
+→ promotion / rollback
+```
+
+Бизнес-смысл: заранее выявлять станции, где через час может остаться слишком мало велосипедов, чтобы оператор мог принять решение о ребалансировке.
+
+---
+
+## 2. Архитектура серверов
 
 В проекте используются два сервера.
 
-### 1.1. Persistent Raw Ingestion Server
+### Persistent Raw Ingestion Server
 
 Существующий сервер, не управляемый Terraform.
 
-Назначение:
-
-- регулярно собирает live GBFS данные Citi Bike;
-- сохраняет первичные raw snapshots;
-- остаётся постоянным хранилищем raw-данных;
-- не удаляется при `terraform destroy`.
-
-Путь к raw-данным на старом сервере:
+Он регулярно собирает live GBFS данные Citi Bike и сохраняет raw snapshots:
 
 ```text
 /srv/bikeml/raw/gbfs/
@@ -35,21 +69,13 @@
 └── station_information/YYYY/MM/DD/*.json.gz
 ```
 
-Collector на старом сервере продолжает собирать данные примерно каждые 5 минут.
+Этот сервер остаётся постоянным raw-хранилищем и не удаляется при `terraform destroy`.
 
-На старом сервере создан отдельный read-only SSH-пользователь:
-
-```text
-bikeml_ro
-```
-
-Он используется новым MLOps-сервером только для чтения raw GBFS данных.
-
-### 1.2. MLOps Server
+### MLOps Server
 
 Новый сервер в Hetzner Cloud, созданный через Terraform.
 
-Фактически использованная конфигурация:
+Фактическая конфигурация:
 
 ```text
 Hetzner CX33
@@ -61,13 +87,13 @@ Docker + Docker Compose
 user: deploy
 ```
 
-На этом сервере поднят основной MLOps-стек.
+На этом сервере работает основной MLOps-стек.
 
 ---
 
-## 2. Базовый MLOps-стек
+## 3. Основные компоненты
 
-Стек запускается через Docker Compose в проекте:
+Стек запускается через Docker Compose:
 
 ```bash
 docker compose -p bikeml up -d
@@ -75,24 +101,16 @@ docker compose -p bikeml up -d
 
 Основные сервисы:
 
-| Сервис | Назначение |
+| Компонент | Роль |
 |---|---|
-| PostgreSQL | metadata Airflow, backend MLflow, проектная БД `bikeml` |
-| MinIO | S3-compatible object storage |
-| Redis | будущий online store для Feast |
-| MLflow | tracking server и будущий model registry |
-| Airflow | orchestration DAGs |
-| Airflow custom image | Airflow + `rsync`, `openssh-client`, `mc` |
+| PostgreSQL | Airflow metadata, MLflow backend, проектная БД `bikeml` |
+| MinIO | S3-compatible object storage для raw/model/report artifacts |
+| MLflow | Tracking server + Model Registry |
+| Airflow | Оркестрация ingestion, feature engineering, training, quality gate |
+| Redis | Зарезервирован под будущий online store |
+| FastAPI | Serving API: `/health`, `/predict/station`, `/predict/batch` |
 
-Созданные базы PostgreSQL:
-
-```text
-airflow
-mlflow
-bikeml
-```
-
-Созданные MinIO bucket-ы:
+MinIO buckets:
 
 ```text
 bikeml-raw
@@ -103,11 +121,273 @@ bikeml-reports
 
 ---
 
-## 3. Доступ к UI
+## 4. Данные
+
+### Offline training data
+
+Исторические поездки Citi Bike:
+
+```text
+https://s3.amazonaws.com/tripdata/
+```
+
+Используются месячные CSV/ZIP-файлы. На текущем этапе загружены данные за февраль–май 2026.
+
+Из tripdata строится чистый supervised target:
+
+```text
+departures_1h
+returns_1h
+delta_bikes_1h = returns_1h - departures_1h
+```
+
+Агрегация выполняется по паре:
+
+```text
+station_id × hour
+```
+
+### Online data
+
+Live GBFS `station_status` используется для текущего состояния станции:
+
+```text
+current_bikes
+current_docks
+capacity
+state_age_seconds
+stale_state
+```
+
+GBFS `station_information` используется для метаданных станции и mapping.
+
+### Station mapping
+
+Historical trip CSV использует legacy station id / short name, а live GBFS использует UUID-like `station_id`.
+
+Связка выполняется через:
+
+```text
+station_information.short_name
+```
+
+Маппинг проверяется отдельно, служебные и внешние станции фильтруются.
+
+### Weather
+
+Погодные данные берутся из Open-Meteo:
+
+- archive API для train/test;
+- forecast API для inference.
+
+В MVP это осознанный train/serving skew: обучение использует фактическую историческую погоду, inference использует прогноз погоды на целевой час.
+
+---
+
+## 5. Airflow DAGs
+
+### `gbfs_ingestion_bridge`
+
+DAG синхронизирует raw GBFS данные со старого raw ingestion server на MLOps server и в MinIO.
+
+Цепочка задач:
+
+```text
+sync_gbfs_raw_to_minio
+→ check_upstream_freshness
+→ parse_station_information
+→ parse_station_status
+→ build_gbfs_online_features
+```
+
+Задача `check_upstream_freshness` проверяет, что новый сервер не работает на устаревших данных.
+
+### `monthly_tripdata_ingestion`
+
+DAG отвечает за monthly retraining lifecycle.
+
+Цепочка задач:
+
+```text
+check_and_download_tripdata
+→ continue_if_new_file
+→ parse_new_tripdata
+→ fetch_weather_for_new_tripdata
+→ build_station_hourly_features
+→ build_delta_training_features
+→ evaluate_current_champion_on_new_test
+→ train_delta_lightgbm_weather
+→ promote_delta_candidate_if_passed
+→ train_delta_xgboost_weather_challenger
+```
+
+Логика:
+
+1. Проверить появление нового monthly tripdata.
+2. Скачать новый файл, если он появился.
+3. Распарсить поездки в hourly demand tables.
+4. Скачать weather archive за тот же месяц.
+5. Пересобрать feature tables.
+6. Переоценить текущий champion на новом test split.
+7. Обучить LightGBM candidate.
+8. Принять решение promotion/reject через честный quality gate.
+9. Обучить XGBoost challenger.
+
+---
+
+## 6. Модели и MLflow Registry
+
+Основная production-модель:
+
+```text
+bikeml_delta_bikes_forecaster
+```
+
+MLflow aliases:
+
+| Alias | Назначение |
+|---|---|
+| `@champion` | production-модель для serving |
+| `@candidate` | новая LightGBM-модель после monthly retraining |
+| `@challenger` | XGBoost-модель для сравнения устойчивости |
+
+Текущая production-постановка:
+
+```text
+target = delta_bikes_1h
+features = hour, day_of_week, is_weekend, month, lat, lon, capacity, weather
+```
+
+Trip-lag модель сохранена только как offline benchmark / upper bound и не используется в serving, потому что её lag-фичи недоступны в live inference.
+
+---
+
+## 7. Quality gate
+
+Candidate-модель не становится champion автоматически.
+
+При появлении нового месяца:
+
+1. Текущий `@champion` переоценивается на новом test split.
+2. Новая LightGBM candidate обучается и оценивается на том же test split.
+3. Candidate получает promotion только если:
+
+```text
+candidate_MAE <= champion_MAE_on_same_test_df * 0.99
+AND candidate_MAE < baseline_MAE
+```
+
+Если условие не выполнено:
+
+```text
+@champion остаётся прежним
+@candidate сохраняется как отклонённая версия
+```
+
+Rollback выполняется переключением MLflow alias `@champion` на предыдущую стабильную версию.
+
+---
+
+## 8. Текущий статус
+
+Реализовано:
+
+```text
+Terraform provisioning
+Docker Compose MLOps stack
+PostgreSQL / MinIO / MLflow / Airflow
+GBFS ingestion bridge
+structured GBFS layer
+station_id_mapping
+monthly tripdata ingestion
+automatic pickup of new monthly CSV
+weather archive ingestion
+delta feature engineering
+LightGBM weather model
+XGBoost weather challenger
+MLflow champion/candidate/challenger aliases
+fair quality gate with champion re-evaluation
+```
+
+Подтверждён живой monthly retraining scenario:
+
+```text
+202605-citibike-tripdata.zip появился на S3
+→ DAG скачал файл
+→ распарсил май
+→ скачал weather archive за май
+→ пересобрал delta features
+→ обучил candidate/challenger
+→ выполнил fair quality gate
+```
+
+---
+
+## 9. Проверки
+
+### Проверить контейнеры
+
+```bash
+docker compose -p bikeml ps
+```
+
+### Проверить Airflow DAGs
+
+```bash
+docker compose -p bikeml exec airflow-scheduler bash -lc 'airflow dags list'
+```
+
+```bash
+docker compose -p bikeml exec airflow-scheduler bash -lc 'airflow tasks list monthly_tripdata_ingestion'
+```
+
+### Проверить MLflow aliases
+
+```bash
+docker compose -p bikeml exec airflow-scheduler bash -lc '
+python - <<PY
+import mlflow
+from mlflow.tracking import MlflowClient
+
+mlflow.set_tracking_uri("http://mlflow:5000")
+client = MlflowClient("http://mlflow:5000")
+
+name = "bikeml_delta_bikes_forecaster"
+
+for alias in ["champion", "candidate", "challenger"]:
+    mv = client.get_model_version_by_alias(name, alias)
+    print(alias, "version=", mv.version, "run_id=", mv.run_id, "tags=", dict(mv.tags))
+PY
+'
+```
+
+### Проверить последние model evaluation runs
+
+```bash
+docker exec -it bikeml-postgres psql -U bikeml_admin -d bikeml -c "
+SELECT
+    id,
+    model_type,
+    registered_model_version,
+    rows_test,
+    ROUND(mae_delta::numeric, 6) AS mae_delta,
+    ROUND(rmse_delta::numeric, 6) AS rmse_delta,
+    ROUND(bias_delta::numeric, 6) AS bias_delta,
+    promotion_decision,
+    created_at
+FROM delta_model_evaluation_runs
+ORDER BY created_at DESC
+LIMIT 10;
+"
+```
+
+---
+
+## 10. Доступ к UI
 
 UI-порты не открываются наружу. Доступ выполняется через SSH-туннель.
 
-Пример с Windows PowerShell:
+Пример Windows PowerShell:
 
 ```powershell
 ssh -i "$env:USERPROFILE\.ssh\id_ed25519_mlops_exam" `
@@ -127,113 +407,11 @@ MinIO:   http://127.0.0.1:9001
 
 ---
 
-## 4. Raw GBFS ingestion bridge
-
-Реализован Airflow DAG:
-
-```text
-gbfs_ingestion_bridge
-```
-
-Расписание:
-
-```text
-*/15 * * * *
-```
-
-То есть DAG запускается каждые 15 минут.
-
-Текущая цепочка задач:
-
-```text
-sync_gbfs_raw_to_minio
-    ↓
-check_upstream_freshness
-```
-
-### 4.1. Task `sync_gbfs_raw_to_minio`
-
-Задача запускает скрипт:
-
-```text
-/opt/airflow/scripts/sync_gbfs_raw.sh
-```
-
-Скрипт выполняет:
-
-1. rsync `latest/` со старого ingestion-сервера;
-2. rsync `station_status/` archive;
-3. rsync `station_information/` archive;
-4. mirror `station_status` в MinIO bucket `bikeml-raw`;
-5. mirror `station_information` в MinIO bucket `bikeml-raw`;
-6. mirror `latest` в MinIO bucket `bikeml-raw`;
-7. выводит контрольные counts.
-
-Стратегия синхронизации:
-
-```text
-latest/              rsync без --ignore-existing, потому что файлы перезаписываются
-dated archive         rsync с --ignore-existing, потому что json.gz файлы иммутабельны
-MinIO dated archive   mc mirror без --overwrite
-MinIO latest          mc mirror --overwrite
-```
-
-Пример итоговых логов успешного запуска:
-
-```text
-station_status local files: 254
-station_information local files: 28
-
-station_status MinIO files: 254
-station_information MinIO files: 28
-
-Latest station_status key in MinIO:
-local/bikeml-raw/gbfs/station_status/2026/06/03/station_status_20260603_173105.json.gz
-```
-
-### 4.2. Task `check_upstream_freshness`
-
-Задача запускает скрипт:
-
-```text
-/opt/airflow/scripts/check_upstream_freshness.py
-```
-
-Скрипт проверяет, что новый сервер не работает молча на устаревших данных.
-
-Проверки:
-
-- `collector_status.json` существует;
-- `collector_status.status == "ok"`;
-- `station_status_rows > 0`;
-- `last_success_utc` не старше порога;
-- самый свежий `station_status_*.json.gz` файл не старше порога.
-
-Порог задаётся переменной:
-
-```env
-UPSTREAM_FRESHNESS_MAX_AGE_MINUTES=30
-```
-
-Пример успешной проверки:
-
-```text
-collector_status.status=ok
-collector_status.station_status_rows=2410
-last_success_age_seconds=15
-latest_station_status_file_age_seconds=16
-FRESHNESS_CHECK_OK
-```
-
-Если freshness-check падает, Airflow task завершается ошибкой. Это предотвращает ситуацию, когда DAG зелёный, но данные фактически устарели.
-
----
-
-## 5. Переменные окружения
+## 11. Переменные окружения
 
 Реальные секреты хранятся в `.env`, который не должен попадать в Git.
 
-Шаблон должен храниться в:
+Шаблон хранится в:
 
 ```text
 .env.example
@@ -249,155 +427,40 @@ INGESTION_SSH_KEY_PATH=/opt/airflow/.ssh/bikeml_ingestion_read
 UPSTREAM_FRESHNESS_MAX_AGE_MINUTES=30
 ```
 
-Важно: приватный SSH-ключ для Airflow хранится на MLOps-сервере в отдельной папке:
+---
 
-```text
-/mnt/mlops-data/airflow/ssh/bikeml_ingestion_read
-```
+## 12. Known limitations
 
-Он монтируется в Airflow container read-only:
+Ограничения MVP:
 
-```text
-/opt/airflow/.ssh/bikeml_ingestion_read
-```
+1. FastAPI serving layer находится в работе.
+2. Full Feast implementation вынесен в stretch; MVP использует feature tables в PostgreSQL.
+3. Great Expectations, Evidently, Prometheus/Grafana вынесены в stretch.
+4. Ребалансировка не моделируется, так как нет данных о действиях оператора.
+5. Погода в train берётся из archive API, а в inference будет использовать forecast API.
+6. Production SLA, multi-region и отказоустойчивость коммерческого уровня не входят в MVP.
 
 ---
 
-## 6. Проверки
+## 13. Следующие шаги
 
-### 6.1. Проверить контейнеры
-
-```bash
-docker compose -p bikeml ps
-```
-
-Ожидаем, что основные сервисы работают:
-
-```text
-bikeml-postgres
-bikeml-minio
-bikeml-redis
-bikeml-mlflow
-bikeml-airflow-webserver
-bikeml-airflow-scheduler
-```
-
-### 6.2. Проверить Airflow DAG
-
-```bash
-docker compose -p bikeml exec airflow-scheduler bash -lc 'airflow dags list | grep gbfs'
-```
-
-Ожидаемый DAG:
-
-```text
-gbfs_ingestion_bridge
-```
-
-Проверить задачи DAG:
-
-```bash
-docker compose -p bikeml exec airflow-scheduler bash -lc 'airflow tasks list gbfs_ingestion_bridge'
-```
-
-Ожидаемые задачи:
-
-```text
-check_upstream_freshness
-sync_gbfs_raw_to_minio
-```
-
-### 6.3. Запустить DAG вручную
-
-```bash
-docker compose -p bikeml exec airflow-scheduler bash -lc 'airflow dags trigger gbfs_ingestion_bridge'
-```
-
-### 6.4. Проверить freshness-check log
-
-```bash
-cat "$(find /mnt/mlops-data/airflow/logs/dag_id=gbfs_ingestion_bridge -path '*task_id=check_upstream_freshness*' -type f | sort | tail -n 1)"
-```
-
-В успешном случае должны быть строки:
-
-```text
-FRESHNESS_CHECK_OK
-Command exited with return code 0
-Marking task as SUCCESS
-```
-
-### 6.5. Проверить количество raw-файлов в MinIO
-
-```bash
-docker run --rm \
-  --network bikeml-net \
-  --env-file .env \
-  --entrypoint /bin/sh \
-  minio/mc:latest \
-  -c 'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && mc find local/bikeml-raw/gbfs/station_status --name "*.json.gz" | wc -l'
-```
-
-Последний `station_status` key:
-
-```bash
-docker run --rm \
-  --network bikeml-net \
-  --env-file .env \
-  --entrypoint /bin/sh \
-  minio/mc:latest \
-  -c 'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && mc find local/bikeml-raw/gbfs/station_status --name "*.json.gz" | sort | tail -n 1'
-```
-
----
-
-## 7. Текущий статус
-
-На текущей контрольной точке закрыто:
-
-```text
-Persistent Raw Ingestion Server
-    ↓ read-only SSH user bikeml_ro
-Airflow DAG on MLOps Server
-    ↓ sync_gbfs_raw_to_minio
-Local staging + MinIO bikeml-raw
-    ↓ check_upstream_freshness
-Freshness validation of upstream collector and latest station_status data
-```
-
-Это означает, что raw ingestion bridge работает автоматически и проверяет свежесть upstream-источника.
-
----
-
-## 8. Known limitations
-
-Текущие осознанные ограничения MVP:
-
-1. `StrictHostKeyChecking=no` используется в SSH-команде внутри ingestion script. Для учебного MVP допустимо, но в production лучше закрепить host key старого сервера в `known_hosts`.
-2. Пока нет Telegram/email alert через `on_failure_callback`. Ошибки видны в Airflow UI.
-3. Пока нет FastAPI serving layer, поэтому `stale_state` ещё не возвращается в API-ответах.
-4. Raw GBFS уже попадает в MinIO, но JSON ещё не парсится в PostgreSQL structured tables.
-5. `station_id_mapping` ещё не построен на текущих боевых данных.
-
----
-
-## 9. Следующие шаги
-
-Рекомендуемый порядок дальнейшей реализации:
+Ближайший порядок работ:
 
 1. Зафиксировать текущий checkpoint в Git.
-2. Создать SQL-таблицы для structured GBFS данных.
-3. Спарсить `station_information` и построить `station_id_mapping`.
-4. Подтвердить mapping coverage на текущих данных.
-5. Спарсить `station_status` в `bikeml.gbfs_status_snapshots`.
-6. Добавить DQ counters и таблицу `gbfs_ingestion_log`.
-7. Расширить Airflow DAG task-ом parsing.
-8. После подтверждённого mapping переходить к historical trip CSV ingestion.
-9. Далее — feature engineering, baseline model, MLflow tracking, serving API и monitoring.
+2. Реализовать FastAPI:
+   - `GET /health`;
+   - `POST /predict/station`;
+   - `POST /predict/batch`.
+3. Добавить запись прогнозов в `prediction_log` с `target_time = predicted_at + 1 hour`.
+4. Реализовать online evaluation: сравнение прогнозов с фактическими GBFS snapshots через час.
+5. Подготовить `reports/sli_slo.md` с SLI/SLO на техническом, модельном и бизнес-уровнях.
+6. Подготовить ADR по latency с H0/H1, статистическим тестом и p-value.
+7. Добавить минимальный GitHub Actions workflow.
+8. Финально проверить `/health`, Airflow DAGs, MLflow aliases, teardown-инструкцию.
 
 ---
 
-## 10. Terraform infrastructure note
+## 14. Terraform infrastructure note
 
 Инфраструктура MLOps-сервера создана через Terraform в Hetzner Cloud.
 
