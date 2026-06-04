@@ -4,6 +4,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from prometheus_fastapi_instrumentator import Instrumentator
 
 import mlflow
 import pandas as pd
@@ -80,6 +81,7 @@ class PredictStationResponse(BaseModel):
 
 
 app = FastAPI(title="BikeML Citi Bike Availability API", version="0.1.0")
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 _model = None
 _model_version = None
