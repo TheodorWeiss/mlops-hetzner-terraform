@@ -1,0 +1,77 @@
+name: bikeml deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+
+      - name: setup ssh key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.MLOPS_SECRETS }}" > ~/.ssh/mlops_deploy_key
+          chmod 600 ~/.ssh/mlops_deploy_key
+          ssh-keyscan -p "${{ secrets.MLOPS_PORT }}" "${{ secrets.MLOPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: prepare deploy bundle
+        run: |
+          mkdir -p .deploy
+          cp -r api .deploy/
+          cp -r airflow .deploy/
+          cp -r scripts .deploy/
+          cp -r sql .deploy/
+          cp docker-compose.yml .deploy/
+
+      - name: backup current server files
+        run: |
+          ssh -i ~/.ssh/mlops_deploy_key \
+            -p "${{ secrets.MLOPS_PORT }}" \
+            "${{ secrets.MLOPS_USER }}@${{ secrets.MLOPS_HOST }}" '
+              set -e
+              cd /home/deploy/mlops-stack
+              mkdir -p backups
+              tar \
+                --exclude="backups" \
+                --exclude="__pycache__" \
+                --exclude="*.pyc" \
+                --exclude=".env" \
+                --exclude="*.log" \
+                -czf "backups/mlops-stack-before-github-actions-$(date +%Y%m%d-%H%M%S).tar.gz" \
+                api airflow scripts sql docker-compose.yml || true
+            '
+
+      - name: rsync project files to server
+        run: |
+          rsync -az \
+            -e "ssh -i ~/.ssh/mlops_deploy_key -p ${{ secrets.MLOPS_PORT }}" \
+            .deploy/ \
+            "${{ secrets.MLOPS_USER }}@${{ secrets.MLOPS_HOST }}:/home/deploy/mlops-stack/"
+
+      - name: validate and restart services
+        run: |
+          ssh -i ~/.ssh/mlops_deploy_key \
+            -p "${{ secrets.MLOPS_PORT }}" \
+            "${{ secrets.MLOPS_USER }}@${{ secrets.MLOPS_HOST }}" '
+              set -e
+              cd /home/deploy/mlops-stack
+
+              python3 -m py_compile api/app/main.py
+              python3 -m py_compile scripts/*.py
+              python3 -m py_compile airflow/dags/*.py
+
+              docker compose -p bikeml config > /tmp/bikeml-compose-from-github-actions.yml
+
+              docker compose -p bikeml build api airflow-init airflow-webserver airflow-scheduler
+
+              docker compose -p bikeml up -d api airflow-webserver airflow-scheduler
+
+              sleep 10
+
+              curl --fail http://127.0.0.1:8000/health
+              docker compose -p bikeml ps api airflow-webserver airflow-scheduler
+            '
