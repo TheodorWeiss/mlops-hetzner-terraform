@@ -18,142 +18,193 @@
     "tertiaryColor": "#ffffff"
   }
 }}%%
-flowchart TB
-    %% ===== External data sources =====
-    GBFS["Citi Bike GBFS API<br/>station_status / station_information"]
-    CSV["Historical Trip CSV<br/>S3 tripdata (monthly)"]
-    WX["Weather API"]
-    CAL["Holiday calendar"]
 
-    %% ===== Persistent Raw Ingestion Server =====
-    subgraph INGEST["Persistent Raw Ingestion Server — existing, non-Terraform"]
-        TIMER["systemd timer ~5 min"]
-        COLL["one-shot collector container"]
-        RAW[("raw json.gz snapshots<br/>+ latest + collector_status.json")]
-        WD["watchdog (freshness)"]
+flowchart TB
+
+    %% =========================
+    %% Внешние источники данных
+    %% =========================
+    GBFS["Citi Bike GBFS API<br/>station_status / station_information"]
+    CSV["Исторические Trip CSV<br/>monthly tripdata"]
+    WX["Weather API"]
+    CAL["Календарь праздников"]
+
+    %% =========================
+    %% Сервер сырого сбора
+    %% =========================
+    subgraph INGEST["Сервер сырого сбора — отдельный, постоянный"]
+        direction TB
+        TIMER["systemd timer<br/>каждые ~2 минуты"]
+        COLL["GBFS collector"]
+        RAW[("raw json.gz snapshots<br/>latest / collector_status.json")]
+        WD["watchdog freshness"]
         TG["Telegram alerts"]
+
         TIMER --> COLL
         COLL --> RAW
-        RAW -. freshness check .-> WD
-        COLL -. error alert .-> TG
-        WD -. freshness alert .-> TG
+        RAW -. проверка свежести .-> WD
+        COLL -. ошибки .-> TG
+        WD -. alert .-> TG
     end
 
     GBFS --> COLL
 
-    %% ===== MLOps Server (Terraform-managed) =====
-    subgraph MLOPS["MLOps Server — Terraform-managed, Hetzner CX33"]
+    %% =========================
+    %% Основной MLOps-сервер
+    %% =========================
+    subgraph MLOPS["MLOps Server — Hetzner, Terraform-managed"]
         direction TB
 
-        subgraph PIPE["Orchestration & Data Quality"]
-            AIRFLOW["Airflow DAGs<br/>ingest / features / train / eval / promote"]
-            GX["Great Expectations<br/>data quality"]
-            MAP["station_id_mapping<br/>short_name to station_id"]
+        subgraph ORCH["Оркестрация и пайплайны"]
+            AIRFLOW["Airflow DAGs<br/>ingest → features → train → evaluate → promote"]
+            MAP["station_id_mapping<br/>legacy id ↔ short_name ↔ station_id"]
+            ONLINEEVAL["online evaluation script<br/>evaluate_prediction_log_online.py"]
         end
 
-        subgraph STORE["Storage"]
-            PG[("PostgreSQL<br/>metadata / logs / feature tables")]
-            MINIO[("MinIO<br/>raw / parquet / models / reports")]
+        subgraph STORE["Хранилища"]
+            PG[("PostgreSQL<br/>feature tables / logs / evaluation / prediction_log")]
+            MINIO[("MinIO<br/>raw / processed / models / reports")]
         end
 
-        subgraph FEAT["Feature Store"]
-            FEAST["Feast + Postgres feature tables"]
-        end
-
-        subgraph MLP["ML Platform"]
-            MLFLOW["MLflow<br/>tracking + model registry"]
-            CHAMP["LightGBM champion"]
-            CHAL["XGBoost challenger"]
+        subgraph TRAIN["Обучение и реестр моделей"]
+            TRAINJOB["feature engineering + training<br/>lags / weather / holidays / spatial features"]
+            MLFLOW["MLflow<br/>tracking + registry"]
+            CHAMP["Champion model<br/>LightGBM"]
+            CHAL["Challenger model<br/>другие кандидаты"]
+            QG["quality gate<br/>promote / reject / keep champion"]
         end
 
         subgraph SERVE["Serving"]
-            API["FastAPI<br/>/predict/station · /predict/batch · /health"]
-            NGINX["Nginx"]
+            API["FastAPI<br/>/predict/station<br/>/health<br/>/metrics"]
         end
 
-        subgraph MON["Monitoring"]
+        subgraph MON["Мониторинг"]
             PROM["Prometheus"]
-            GRAF["Grafana"]
-            EVID["Evidently<br/>drift / quality reports"]
+            GRAF["Grafana<br/>read-only dashboard"]
+            NODEX["node-exporter"]
+            CADV["cAdvisor"]
+            PGEXP["postgres-exporter"]
+            BBX["blackbox-exporter"]
+        end
+
+        subgraph CICD["CI/CD"]
+            GHA["GitHub Actions<br/>CI + self-hosted deploy runner"]
+        end
+
+        subgraph FUT["Возможности развития / stretch"]
+            FEAST["Feast feature store"]
+            EVID["Evidently / drift reports"]
+            NGINX["Nginx reverse proxy"]
+            SUP["Superset / BI"]
+            BATCH["/predict/batch"]
         end
     end
 
-    %% ===== External tooling =====
-    GH["GitHub Actions — CI/CD"]
-    SUP["Superset — BI (stretch)"]
+    %% =========================
+    %% Пользователь / потребители
+    %% =========================
+    USER["Пользователь / преподаватель / клиент"]
 
-    %% ===== Data flows into MLOps =====
-    RAW -->|rsync / Airflow SSH| AIRFLOW
+    %% =========================
+    %% Потоки данных
+    %% =========================
+    RAW -->|rsync / Airflow ingest| AIRFLOW
     CSV --> AIRFLOW
     WX --> AIRFLOW
     CAL --> AIRFLOW
 
-    AIRFLOW --> GX
     AIRFLOW --> MAP
-    GX -. validates .-> MAP
-    MAP --> PG
     AIRFLOW --> MINIO
-    PG --> FEAST
-    MINIO --> FEAST
+    AIRFLOW --> PG
+    MAP --> PG
 
-    %% ===== Training & promotion =====
-    FEAST --> AIRFLOW
-    AIRFLOW --> CHAMP
-    AIRFLOW --> CHAL
+    PG --> TRAINJOB
+    MINIO --> TRAINJOB
+    TRAINJOB --> CHAMP
+    TRAINJOB --> CHAL
     CHAMP --> MLFLOW
     CHAL --> MLFLOW
-    MLFLOW -->|quality gate: promote / rollback| API
+    MLFLOW --> QG
+    QG -->|champion alias| API
 
-    %% ===== Serving =====
-    USER["Operator / client"] --> NGINX
-    NGINX --> API
-    FEAST --> API
-    API -->|predictions| PG
+    USER --> API
+    API -->|prediction requests| PG
+    API -->|logged predictions| PG
+    PG --> ONLINEEVAL
+    ONLINEEVAL -->|actual vs predicted| PG
 
-    %% ===== Monitoring & feedback loop =====
+    %% =========================
+    %% Monitoring
+    %% =========================
     API --> PROM
     AIRFLOW --> PROM
+    NODEX --> PROM
+    CADV --> PROM
+    PGEXP --> PROM
+    BBX --> PROM
     PROM --> GRAF
     PG --> GRAF
-    AIRFLOW --> EVID
-    EVID --> MINIO
-    RAW -. future snapshots as labels .-> AIRFLOW
-    GRAF -. degradation alert .-> AIRFLOW
 
-    %% ===== CI/CD & BI =====
-    GH -->|deploy| MLOPS
-    PG -. analytics .-> SUP
+    %% =========================
+    %% CI/CD
+    %% =========================
+    GHA -->|deploy| API
+    GHA -->|deploy| AIRFLOW
 
-    %% ===== Colors =====
+    %% =========================
+    %% Future / stretch flows
+    %% =========================
+    PG -. future .-> FEAST
+    MINIO -. future .-> FEAST
+    FEAST -. future online/offline store .-> API
+    FEAST -. future .-> TRAINJOB
+
+    AIRFLOW -. future .-> EVID
+    EVID -. future reports .-> MINIO
+
+    USER -. future .-> NGINX
+    NGINX -. future .-> API
+    USER -. future .-> SUP
+    API -. future .-> BATCH
+
+    %% =========================
+    %% Легенда
+    %% =========================
+    LEG1["Сплошная рамка = реализовано"]
+    LEG2["Пунктирная рамка = future / stretch"]
+
+    %% =========================
+    %% Цвета
+    %% =========================
     classDef source fill:#dbeafe,stroke:#2563eb,color:#111827,stroke-width:1.5px;
     classDef ingest fill:#dcfce7,stroke:#16a34a,color:#111827,stroke-width:1.5px;
     classDef orchestration fill:#ede9fe,stroke:#7c3aed,color:#111827,stroke-width:1.5px;
     classDef storage fill:#ffedd5,stroke:#ea580c,color:#111827,stroke-width:1.5px;
-    classDef feature fill:#ccfbf1,stroke:#0f766e,color:#111827,stroke-width:1.5px;
-    classDef ml fill:#fce7f3,stroke:#db2777,color:#111827,stroke-width:1.5px;
+    classDef train fill:#fce7f3,stroke:#db2777,color:#111827,stroke-width:1.5px;
     classDef serving fill:#fef3c7,stroke:#d97706,color:#111827,stroke-width:1.5px;
     classDef monitoring fill:#e0f2fe,stroke:#0284c7,color:#111827,stroke-width:1.5px;
     classDef tool fill:#f1f5f9,stroke:#475569,color:#111827,stroke-width:1.5px;
-    classDef stretch fill:#f8fafc,stroke:#64748b,color:#334155,stroke-dasharray:6 4,opacity:0.9;
+    classDef future fill:#f8fafc,stroke:#64748b,color:#334155,stroke-width:1.5px,stroke-dasharray:6 4,opacity:0.95;
 
     class GBFS,CSV,WX,CAL source;
-    class USER tool;
     class TIMER,COLL,RAW,WD,TG ingest;
-    class AIRFLOW,GX,MAP orchestration;
+    class AIRFLOW,MAP,ONLINEEVAL orchestration;
     class PG,MINIO storage;
-    class FEAST feature;
-    class MLFLOW,CHAMP,CHAL ml;
-    class API,NGINX serving;
-    class PROM,GRAF,EVID monitoring;
-    class GH tool;
-    class SUP stretch;
+    class TRAINJOB,MLFLOW,CHAMP,CHAL,QG train;
+    class API serving;
+    class PROM,GRAF,NODEX,CADV,PGEXP,BBX monitoring;
+    class GHA,USER,LEG1 tool;
+    class FEAST,EVID,NGINX,SUP,BATCH,LEG2 future;
 
-    %% ===== Subgraph backgrounds =====
+    %% =========================
+    %% Стили subgraph
+    %% =========================
     style INGEST fill:#f0fdf4,stroke:#16a34a,stroke-width:2px,color:#111827
     style MLOPS fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#111827
-    style PIPE fill:#f5f3ff,stroke:#7c3aed,stroke-width:1.5px,color:#111827
+    style ORCH fill:#f5f3ff,stroke:#7c3aed,stroke-width:1.5px,color:#111827
     style STORE fill:#fff7ed,stroke:#ea580c,stroke-width:1.5px,color:#111827
-    style FEAT fill:#f0fdfa,stroke:#0f766e,stroke-width:1.5px,color:#111827
-    style MLP fill:#fdf2f8,stroke:#db2777,stroke-width:1.5px,color:#111827
+    style TRAIN fill:#fdf2f8,stroke:#db2777,stroke-width:1.5px,color:#111827
     style SERVE fill:#fffbeb,stroke:#d97706,stroke-width:1.5px,color:#111827
     style MON fill:#f0f9ff,stroke:#0284c7,stroke-width:1.5px,color:#111827
+    style CICD fill:#f8fafc,stroke:#475569,stroke-width:1.5px,color:#111827
+    style FUT fill:#f8fafc,stroke:#64748b,stroke-width:1.5px,stroke-dasharray:6 4,color:#334155

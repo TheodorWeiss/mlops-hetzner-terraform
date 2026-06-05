@@ -6,6 +6,7 @@
 **Инфраструктура:** Hetzner Cloud (новый сервер, провижен через Terraform) + существующий сервер для сбора raw-данных.
 **Репозиторий инфраструктуры:** github.com/TheodorWeiss/mlops-hetzner-terraform
 **Дата:** июнь 2026.
+**Статус документа:** финальный срез перед защитой. Раздел 4 отражает фактически реализованные компоненты; то, что осталось в stretch (Feast, Evidently/GX, алертинг, Nginx), помечено явно и при доработке будет повышено.
 
 ---
 
@@ -65,7 +66,7 @@
 | CI/CD выкатки на прод | GitHub Actions (lint/тесты/сборка/деплой) |
 | Фича-стор | feature-таблицы в Postgres (привязаны к временным окнам и source month); Feast-versioning — stretch |
 | Сервинг через API | FastAPI (`/health`, `/predict/station`, `/predict/batch`) |
-| Мониторинг качества | `model_evaluation_runs` + `prediction_log` + health-checks/логи; Prometheus/Grafana и Evidently — stretch |
+| Мониторинг качества | Prometheus + Grafana (3-уровневый дашборд) + `model_evaluation_runs` + `prediction_log` + online-оценка + health-checks; Evidently — stretch |
 | Управление экспериментами | MLflow (tracking + model registry, alias champion/challenger) |
 | Оркестратор | Airflow (DAG приёма, обучения, оценки, промоута) |
 
@@ -77,19 +78,20 @@
 - Feature store: **feature-таблицы в Postgres**, привязанные к временным окнам и source month; полноценный feature-store/versioning через Feast — stretch
 - Storage: **Postgres** (mapping, feature tables, prediction logs, eval runs) + **MinIO** (raw, parquet, models, reports)
 - Сервинг: **FastAPI** (`/health`, `/predict/station`, `/predict/batch`)
-- Мониторинг (lightweight): **`model_evaluation_runs` + `prediction_log`** + health-checks/логи + `check_upstream_freshness`
-- CI/CD: **GitHub Actions**
+- Мониторинг: **Prometheus + Grafana** (дашборд «BikeML MLOps Monitoring» на 3 уровнях: технический/модельный/бизнес; экспортёры node/cadvisor/postgres/blackbox + FastAPI `/metrics`) + **`model_evaluation_runs` + `prediction_log` + online-оценка** + `check_upstream_freshness`; read-only доступ: http://128.140.1.182:3000/d/cfo5yiooy17uoc/bikeml-mlops-monitoring
+- CI/CD: **GitHub Actions** (CI на push + ручной CD через self-hosted runner на сервере)
 - IaC: **Terraform** (провижен сервера/firewall/volume) + **docker-compose** (стек)
 - Базовый Data Quality: проверки в парсерах (флаги, `last_reported`, аномалии поездок) с записью DQ-счётчиков в лог-таблицы
 
-Статус: **реализовано** — Airflow, MLflow, Postgres, MinIO, Terraform/docker-compose, monthly retraining DAG, structured-слой, ingestion-bridge, feature engineering, production-compatible модель (LightGBM delta + weather) и XGBoost-челленджер. **В работе** — честный quality gate с переоценкой текущего champion на новом тест-месяце, FastAPI, GitHub Actions, SLI/SLO, ADR.
+Статус: **реализовано** — Terraform/docker-compose, Airflow (ingestion-bridge + monthly retraining DAG), MLflow (registry + champion/candidate/challenger), Postgres, MinIO, structured-слой, ingestion-bridge, feature engineering, production-модель (LightGBM delta + weather) и XGBoost-челленджер, **честный quality gate с переоценкой champion на новом тест-месяце**, **FastAPI** (`/health`, `/predict/station`, `/predict/batch`, `/metrics`), **prediction_log + online-оценка**, **CI/CD (GitHub Actions + self-hosted runner)**, **Prometheus/Grafana мониторинг на 3 уровнях (дашборд: http://128.140.1.182:3000/d/cfo5yiooy17uoc/bikeml-mlops-monitoring)**, **`reports/sli_slo.md`** и **`adr/ADR-001-latency-serving-path.md`**. Подтверждён живой сценарий автоподхвата нового месячного CSV (202605) и переобучения. **В работе / stretch** — Feast, Evidently drift-reports, автоматический алертинг, выделенные Grafana-панели precision/recall low-availability (по мере накопления положительных случаев), Nginx.
 
 *Stretch (строим по остатку времени; не заявляются как готовые, пока не работают):*
 - **Feast** как полноценный feature-store-адаптер поверх Postgres feature tables
 - **Great Expectations** — формализация DQ-проверок в suite
 - **Evidently** — drift/quality HTML-отчёты в MinIO
-- **Prometheus + Grafana** — технические дашборды
-- **Nginx** reverse proxy
+- **Автоматический алертинг** (Prometheus/Grafana alert rules; сейчас мониторинг есть, алертинг — нет)
+- **Nginx** reverse proxy с TLS
+- Выделенные Grafana-панели precision/recall low-availability (после накопления положительных случаев)
 - **Superset** (BI-кабинет оператора), **OpenMetadata/DataHub** (data catalog) — явно вне scope MVP
 
 Принцип: всё, что в must-have, к защите реально работает (`docker ps` healthy, `/health`=200). Stretch-компоненты присутствуют на схеме архитектуры как план развития и повышаются до must-have только по факту реализации.
@@ -102,7 +104,7 @@
 - Champion/challenger с честным quality gate (переоценка champion на том же тест-месяце); rollback переключением alias.
 - Месячное переобучение на свежем CSV; live GBFS — текущая точка отсчёта и мониторинг свежести.
 
-**Интеграции:** live GBFS (`station_status`, `station_information`), historical trip CSV (S3), погодный API (Open-Meteo: архив для train, forecast для inference). Календарь праздников и `region_id` — future-фичи (в MVP-модель не входят).
+**Интеграции:** live GBFS (`station_status`, `station_information`), historical trip CSV (S3), погодный API (Open-Meteo: архив для train, forecast для inference). Календарь праздников и `region_id` — будущие фичи (в MVP-модель не входят).
 
 **Ограничения (осознанные упрощения MVP):**
 - Облако — экономичное (сервис должен жить до защиты).
@@ -140,7 +142,7 @@
 - *Качество/свежесть live-данных* → DQ-проверки в парсерах + `check_upstream_freshness` (чтение `collector_status.json` + возраст снепшота) + флаг `stale_state` в ответах API.
 - *Несовпадение станций CSV↔GBFS* → снят через `station_id_mapping` (coverage 1.0000).
 
-**Текущий статус реализации (на момент манифеста):** провижена инфраструктура (Terraform), поднят стек (Postgres/MinIO/MLflow/Airflow), работает ingestion-bridge, structured-слой GBFS, historical trip ingestion (фев–апр + автоподхват нового месяца), feature engineering, обучены модели, champion/challenger в MLflow, monthly retraining DAG. В работе: production-compatible модель, FastAPI, SLI/SLO, ADR.
+**Текущий статус реализации (финальный срез).** Провижена инфраструктура (Terraform), поднят стек (Postgres/MinIO/MLflow/Airflow), работают оба DAG (ingestion-bridge + monthly retraining), structured-слой GBFS, historical trip ingestion (фев–май, автоподхват 202605 подтверждён), feature engineering, production-модель + челленджер в MLflow, честный quality gate, FastAPI (`/health`, `/predict`, `/metrics`), prediction_log + online-оценка, CI/CD (GitHub Actions + self-hosted runner), Prometheus/Grafana на 3 уровнях, `sli_slo.md` и `ADR-001-latency.md`. В работе / stretch: Feast, Evidently, алертинг, Nginx.
 
 ## 6. Данные
 
@@ -162,7 +164,7 @@
 
 **Два контура.** Обучение/переобучение — на месячном CSV (чистый target `delta_bikes`); online-контур (снепшоты) — текущая точка отсчёта `current_bikes` для прогноза + фактическое наличие для продуктовых метрик + мониторинг свежести.
 
-**Статус валидации данных.** Данные прошли валидацию на боевых данных: `station_id_mapping` через `short_name` — в актуальном GBFS coverage `short_name` = 1.0000, дублей 0 (coverage строк trip CSV контролируется отдельно после фильтрации служебных станций); загружены фев–апр 2026 (~2.5 млн станция-час строк), автоподхват нового месяца подтверждён. Главный риск интеграции источников снят.
+**Статус валидации данных.** Данные прошли валидацию на боевых данных: `station_id_mapping` через `short_name` — в актуальном GBFS coverage `short_name` = 1.0000, дублей 0 (coverage строк trip CSV контролируется отдельно после фильтрации служебных станций); загружены фев–май 2026, автоподхват нового месяца (202605) подтверждён живым прогоном monthly DAG. Главный риск интеграции источников снят.
 
 ## 7. Метрики
 
@@ -212,7 +214,7 @@ Target — `delta_bikes_1h`.
 ## 9. Подбор модели (итеративно)
 
 - **Итерация 0 — Baseline.** Zero-change (`delta = 0`) и «вчера в этот час». Нижняя граница, которую всё обязано бить.
-- **Итерация 1 — Offline benchmark (LightGBM на trip-лагах).** Target = departures/returns, фичи включают `lag_1h/24h/168h`. Показала, что в данных есть сильный сигнал (MAE потоков ~1.73 против baseline ~3.33). **Не идёт в serving** — её trip-лаги недоступны в реальном времени. Роль: верхняя граница качества (upper bound) для MDD/ADR.
+- **Итерация 1 — Offline benchmark (LightGBM на trip-лагах).** Target = departures/returns, фичи включают `lag_1h/24h/168h`. Показала, что в данных есть сильный сигнал (MAE потоков ~1.73 против baseline ~3.33). **Не идёт в serving** — её trip-лаги недоступны в реальном времени. Роль: верхняя граница качества (верхняя граница качества) для MDD/ADR.
 - **Итерация 2 — Production-модель (LightGBM, основная).** Target = `delta_bikes_1h`. **Фичи MVP** (только онлайн-доступные): `hour`, `day_of_week`, `is_weekend`, `month` (локальное NY-время), `lat`, `lon`, `capacity`, погода. Соблюдён **feature contract: train features = inference features**. Погода: исторический архив для train, **forecast на целевой час для inference** — это осознанно принятый для MVP train/serving skew, зафиксирован как ограничение. **Stretch/future фичи:** `region_id`, праздники, соседние станции, доля e-bike. Это champion для serving.
 - **Итерация 3 — Тюнинг** через time-series CV.
 - **Итерация 4 — XGBoost-челленджер** для production-модели — проверка устойчивости выбора LightGBM в рамках champion/challenger.
@@ -247,7 +249,7 @@ Target — `delta_bikes_1h`.
 
 Цикл: появление нового месяца → retraining DAG → переоценка champion на новом месяце → candidate vs champion на одном окне → promotion (alias `@champion`) или сохранение текущего → при необходимости rollback переключением alias.
 
-**MDD — Да.** Архитектурные решения — на основе метрик: выбор модели через сравнение с baseline и benchmark; промоут через честный quality gate; ключевые решения оформляются как **ADR**. Запланированные ADR: (1) latency — расчёт признаков on-demand vs готовые из feature store (два набора latency, H0/H1, статтест, p-value, решение); (2) выбор serving-архитектуры — offline benchmark (trip-лаги) vs production-модель (онлайн-доступные фичи), обоснование через feature contract.
+**MDD — Да.** Архитектурные решения — на основе метрик: выбор модели через сравнение с baseline и benchmark; промоут через честный quality gate; ключевые решения оформляются как **ADR**. **Реализовано: `adr/ADR-001-latency-serving-path.md`** — сравнение latency полного prediction-path (`/predict/station`) против лёгкого `/health` на двух наборах по 30 замеров: сформулированы H0/H1, выбран уровень значимости (α=0.05), проведены Welch t-test и Mann-Whitney U (p-value ≈ 9.85e-24 и 1.51e-11), H0 отклонена; итоговое решение — принять текущий serving-path для MVP, т.к. наблюдаемый p95 ≈ 0.055 с < SLO 2 с, а кэширование погоды/отдельный слой отдачи фичей зафиксированы как future. Возможный второй ADR (выбор serving-архитектуры: offline-бенчмарк на trip-лагах vs production-модель на онлайн-доступных фичах) — по остатку времени.
 
 ## 12. Управление проектом
 
@@ -255,18 +257,19 @@ Target — `delta_bikes_1h`.
 
 **Сроки:** ~2–3 недели, по этапам:
 1. Данные + baseline + проверки распределения/аномалий/capacity_gap.
-2. MLOps-компоненты (core pipeline сначала: данные → baseline → training → FastAPI → MLflow → Airflow; затем Feast → monitoring).
+2. MLOps-компоненты: данные → baseline → training → FastAPI → MLflow → Airflow → monitoring; Feast вынесен в stretch.
 3. Контейнеризация + IaC (Terraform — сделано; docker-compose для стека).
 4. Автоцикл переобучения + champion/challenger + переключение трафика.
 5. CI/CD (GitHub Actions).
-6. Мониторинг + SLI/SLO: lightweight через health-checks, логи, `model_evaluation_runs`, `prediction_log`; Prometheus/Grafana, Evidently, GX — stretch.
+6. Мониторинг + SLI/SLO: Prometheus/Grafana на 3 уровнях (технический/модельный/бизнес) + `model_evaluation_runs`/`prediction_log`/online-оценка + health-checks; Evidently, алертинг — stretch.
 7. Развёртывание в облаке, проверка `/health`=200 и `docker ps` healthy.
 8. MDD: статистический анализ latency + ADR.
 9. Текстовые артефакты + сборка репозитория (README, манифест, диаграмма, ADR, инструкция teardown).
 10. Подготовка к устной защите.
 
 **Конечные результаты (deliverables):**
-- Репозиторий: код + текстовые артефакты — `MANIFEST.md`, диаграмма архитектуры, `reports/sli_slo.md` (SLI/SLO на 3 уровнях), `adr/ADR-001-latency.md` (статтест по latency), инструкция teardown.
-- Развёрнутый в облаке работающий сервис (`/health`=200), живой до защиты.
-- Воспроизводимая инфраструктура (Terraform + docker-compose; `terraform destroy` для teardown).
-- Демонстрация полного цикла: данные → обучение → оценка → честный quality gate (переоценка champion) → promotion/rollback через MLflow-alias; живой пример автоподхвата нового месячного CSV и переобучения.
+- Репозиторий: код + текстовые артефакты — `MANIFEST.md`, диаграмма архитектуры, `reports/sli_slo.md` (SLI/SLO на 3 уровнях с порогами), `adr/ADR-001-latency-serving-path.md` (статтест по latency), инструкция teardown.
+- Развёрнутый в облаке работающий сервис (`/health`=200, `docker ps` healthy), живой до защиты; Grafana-дашборд мониторинга: http://128.140.1.182:3000/d/cfo5yiooy17uoc/bikeml-mlops-monitoring.
+- CI/CD: GitHub Actions (CI на push + ручной CD через self-hosted runner).
+- Воспроизводимая инфраструктура (Terraform + docker-compose; `terraform destroy` для teardown; перед destroy — разрегистрация self-hosted runner).
+- Демонстрация полного цикла: данные → обучение → оценка → честный quality gate (переоценка champion) → promotion/rollback через MLflow-alias; живой пример автоподхвата нового месячного CSV (202605) и переобучения.

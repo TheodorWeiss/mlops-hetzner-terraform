@@ -2,7 +2,7 @@
 
 Учебный MLOps-проект по прогнозу изменения доступности велосипедов на станциях Citi Bike на горизонте 1 час.
 
-MVP строит production-like ML-систему уровня зрелости 2: от сбора данных и feature engineering до Airflow pipeline, MLflow Model Registry, champion/candidate/challenger workflow, честного quality gate, serving API и мониторинга.
+Проект строит production-like ML-систему уровня зрелости 2: от сбора данных и feature engineering до Airflow pipeline, MLflow Model Registry, champion/candidate/challenger workflow, честного quality gate, FastAPI serving, CI/CD и мониторинга в Prometheus/Grafana.
 
 Основная модель прогнозирует:
 
@@ -17,10 +17,16 @@ predicted_bikes_1h = current_bikes_now + predicted_delta_bikes_1h
 predicted_bikes_1h = clip(predicted_bikes_1h, 0, capacity)
 ```
 
-Поверх прогноза вычисляется производный сигнал:
+Поверх прогноза вычисляется производный бизнес-сигнал:
 
 ```text
 low_availability_risk = predicted_bikes_1h <= threshold
+```
+
+Главный манифест проекта:
+
+```text
+MANIFEST.md
 ```
 
 ---
@@ -40,8 +46,10 @@ raw data
 → champion/candidate/challenger
 → quality gate
 → serving
+→ логирование прогнозов
+→ online-оценку прогнозов
 → monitoring
-→ monthly retraining
+→ ежемесячное переобучение
 → promotion / rollback
 ```
 
@@ -53,7 +61,7 @@ raw data
 
 В проекте используются два сервера.
 
-### Persistent Raw Ingestion Server
+### 2.1. Persistent Raw Ingestion Server
 
 Существующий сервер, не управляемый Terraform.
 
@@ -71,27 +79,72 @@ raw data
 
 Этот сервер остаётся постоянным raw-хранилищем и не удаляется при `terraform destroy`.
 
-### MLOps Server
+Для доступа к нему используется отдельный read-only пользователь:
+
+```text
+bikeml_ro
+```
+
+Это осознанное security-решение: MLOps-сервер может читать raw GBFS snapshots, но не должен иметь root-доступ к persistent raw server.
+
+### 2.2. MLOps Server
 
 Новый сервер в Hetzner Cloud, созданный через Terraform.
 
 Фактическая конфигурация:
 
 ```text
-Hetzner CX33
-4 vCPU
-8 GB RAM
+Hetzner Cloud
 Ubuntu 24.04 LTS
 mounted volume: /mnt/mlops-data
 Docker + Docker Compose
 user: deploy
 ```
 
-На этом сервере работает основной MLOps-стек.
+На этом сервере работает основной MLOps-стек:
+
+```text
+PostgreSQL
+MinIO
+MLflow
+Airflow
+Redis
+FastAPI
+Prometheus
+Grafana
+exporters
+self-hosted GitHub Actions runner
+```
 
 ---
 
-## 3. Основные компоненты
+## 3. Terraform / IaC
+
+Инфраструктура MLOps-сервера создана через Terraform в Hetzner Cloud.
+
+Terraform отвечает за:
+
+- создание нового сервера;
+- firewall;
+- SSH key;
+- volume;
+- базовую подготовку сервера через cloud-init;
+- установку Docker/Docker Compose;
+- подготовку пользователя `deploy`.
+
+Docker Compose отвечает за runtime-стек сервисов внутри уже созданного сервера.
+
+Старый Persistent Raw Ingestion Server не импортируется в Terraform и не управляется через него. Он остаётся отдельным постоянным raw ingestion сервером.
+
+Подробное описание Terraform-конфигурации находится в:
+
+```text
+terraform/README.md
+```
+
+---
+
+## 4. Основные компоненты
 
 Стек запускается через Docker Compose:
 
@@ -103,12 +156,19 @@ docker compose -p bikeml up -d
 
 | Компонент | Роль |
 |---|---|
-| PostgreSQL | Airflow metadata, MLflow backend, проектная БД `bikeml` |
+| PostgreSQL | Airflow metadata, MLflow backend, проектная БД `bikeml`, feature tables, prediction logs |
 | MinIO | S3-compatible object storage для raw/model/report artifacts |
 | MLflow | Tracking server + Model Registry |
 | Airflow | Оркестрация ingestion, feature engineering, training, quality gate |
 | Redis | Зарезервирован под будущий online store |
-| FastAPI | Serving API: `/health`, `/predict/station`, `/predict/batch` |
+| FastAPI | Serving API: `/health`, `/predict/station`, `/predict/batch`, `/metrics` |
+| Prometheus | Сбор технических, API и exporter-метрик |
+| Grafana | Dashboard с техническими, модельными и бизнесовыми метриками |
+| Blackbox exporter | HTTP health probes |
+| Node exporter | Метрики сервера |
+| cAdvisor | Метрики Docker containers |
+| Postgres exporter | Метрики PostgreSQL |
+| GitHub Actions self-hosted runner | CD на MLOps-сервере |
 
 MinIO buckets:
 
@@ -121,9 +181,9 @@ bikeml-reports
 
 ---
 
-## 4. Данные
+## 5. Данные
 
-### Offline training data
+### 5.1. Offline training data
 
 Исторические поездки Citi Bike:
 
@@ -133,7 +193,7 @@ https://s3.amazonaws.com/tripdata/
 
 Используются месячные CSV/ZIP-файлы. На текущем этапе загружены данные за февраль–май 2026.
 
-Из tripdata строится чистый supervised target:
+Из tripdata строится supervised target:
 
 ```text
 departures_1h
@@ -147,7 +207,7 @@ delta_bikes_1h = returns_1h - departures_1h
 station_id × hour
 ```
 
-### Online data
+### 5.2. Online data
 
 Live GBFS `station_status` используется для текущего состояния станции:
 
@@ -161,7 +221,7 @@ stale_state
 
 GBFS `station_information` используется для метаданных станции и mapping.
 
-### Station mapping
+### 5.3. Station mapping
 
 Historical trip CSV использует legacy station id / short name, а live GBFS использует UUID-like `station_id`.
 
@@ -171,40 +231,55 @@ Historical trip CSV использует legacy station id / short name, а live
 station_information.short_name
 ```
 
-Маппинг проверяется отдельно, служебные и внешние станции фильтруются.
+Это ключевой mapping-слой проекта: без него невозможно корректно соединить historical trip data и live GBFS station status.
 
-### Weather
+Проверки mapping:
+
+- отсутствие дублей по `short_name`;
+- проверка coverage start/end station ids;
+- фильтрация служебных и внешних станций;
+- сохранение mapping в structured tables.
+
+### 5.4. Weather
 
 Погодные данные берутся из Open-Meteo:
 
 - archive API для train/test;
-- forecast API для inference.
+- forecast API / fallback logic для inference.
 
-В MVP это осознанный train/serving skew: обучение использует фактическую историческую погоду, inference использует прогноз погоды на целевой час.
+В MVP это осознанный train/serving skew: обучение использует фактическую историческую погоду, inference использует прогноз или fallback weather values.
 
 ---
 
-## 5. Airflow DAGs
+## 6. Airflow DAGs
 
-### `gbfs_ingestion_bridge`
+### 6.1. `gbfs_ingestion_bridge`
 
-DAG синхронизирует raw GBFS данные со старого raw ingestion server на MLOps server и в MinIO.
+DAG синхронизирует raw GBFS данные со старого raw ingestion server на MLOps server и строит online features.
 
 Цепочка задач:
 
 ```text
-sync_gbfs_raw_to_minio
+sync_gbfs_raw
 → check_upstream_freshness
 → parse_station_information
 → parse_station_status
 → build_gbfs_online_features
+→ evaluate_prediction_log_online
 ```
 
-Задача `check_upstream_freshness` проверяет, что новый сервер не работает на устаревших данных.
+Логика:
 
-### `monthly_tripdata_ingestion`
+1. синхронизировать latest/raw GBFS snapshots;
+2. проверить свежесть upstream collector;
+3. распарсить `station_information`;
+4. распарсить `station_status`;
+5. собрать `gbfs_online_features`;
+6. оценить созревшие прогнозы из `prediction_log`.
 
-DAG отвечает за monthly retraining lifecycle.
+### 6.2. `monthly_tripdata_ingestion`
+
+DAG отвечает за ежемесячное переобучение lifecycle.
 
 Цепочка задач:
 
@@ -223,19 +298,56 @@ check_and_download_tripdata
 
 Логика:
 
-1. Проверить появление нового monthly tripdata.
-2. Скачать новый файл, если он появился.
-3. Распарсить поездки в hourly demand tables.
-4. Скачать weather archive за тот же месяц.
-5. Пересобрать feature tables.
-6. Переоценить текущий champion на новом test split.
-7. Обучить LightGBM candidate.
-8. Принять решение promotion/reject через честный quality gate.
-9. Обучить XGBoost challenger.
+1. проверить появление нового monthly tripdata;
+2. скачать новый файл, если он появился;
+3. распарсить поездки в hourly demand tables;
+4. скачать weather archive за тот же месяц;
+5. пересобрать feature tables;
+6. переоценить текущий champion на новом test split;
+7. обучить LightGBM candidate;
+8. принять решение promotion/reject через честный quality gate;
+9. обучить XGBoost challenger.
 
 ---
 
-## 6. Модели и MLflow Registry
+## 7. Feature engineering
+
+Основные feature groups:
+
+```text
+time features:
+  hour_ny
+  day_of_week_ny
+  is_weekend_ny
+  month_ny
+
+station metadata:
+  lat
+  lon
+  capacity
+
+weather features:
+  temperature
+  precipitation
+  wind speed / weather-related fields
+
+online state:
+  current_bikes
+  current_docks
+  state_age_seconds
+```
+
+Временные признаки считаются в timezone станции:
+
+```text
+America/New_York
+```
+
+Это важно, потому что рабочая/server timezone может отличаться от timezone Citi Bike station data.
+
+---
+
+## 8. Модели и MLflow Registry
 
 Основная production-модель:
 
@@ -248,7 +360,7 @@ MLflow aliases:
 | Alias | Назначение |
 |---|---|
 | `@champion` | production-модель для serving |
-| `@candidate` | новая LightGBM-модель после monthly retraining |
+| `@candidate` | новая LightGBM-модель после ежемесячное переобучение |
 | `@challenger` | XGBoost-модель для сравнения устойчивости |
 
 Текущая production-постановка:
@@ -262,15 +374,15 @@ Trip-lag модель сохранена только как offline benchmark /
 
 ---
 
-## 7. Quality gate
+## 9. Quality gate
 
 Candidate-модель не становится champion автоматически.
 
 При появлении нового месяца:
 
-1. Текущий `@champion` переоценивается на новом test split.
-2. Новая LightGBM candidate обучается и оценивается на том же test split.
-3. Candidate получает promotion только если:
+1. текущий `@champion` переоценивается на новом test split;
+2. новая LightGBM candidate обучается и оценивается на том же test split;
+3. candidate получает promotion только если:
 
 ```text
 candidate_MAE <= champion_MAE_on_same_test_df * 0.99
@@ -284,46 +396,388 @@ AND candidate_MAE < baseline_MAE
 @candidate сохраняется как отклонённая версия
 ```
 
-Rollback выполняется переключением MLflow alias `@champion` на предыдущую стабильную версию.
+Rollback выполняется переключением MLflow alias:
+
+```text
+@champion -> previous stable version
+```
+
+Это позволяет быстро вернуть production API на предыдущую стабильную модель без переобучения и без пересборки сервиса.
 
 ---
 
-## 8. Текущий статус
+## 10. FastAPI serving
 
-Реализовано:
+FastAPI реализует online serving layer.
+
+Endpoints:
 
 ```text
-Terraform provisioning
-Docker Compose MLOps stack
-PostgreSQL / MinIO / MLflow / Airflow
-GBFS ingestion bridge
-structured GBFS layer
-station_id_mapping
-monthly tripdata ingestion
-automatic pickup of new monthly CSV
-weather archive ingestion
-delta feature engineering
-LightGBM weather model
-XGBoost weather challenger
-MLflow champion/candidate/challenger aliases
-fair quality gate with champion re-evaluation
+GET  /health
+GET  /docs
+POST /predict/station
+POST /predict/batch
+GET  /metrics
 ```
 
-Подтверждён живой monthly retraining scenario:
+### 10.1. `/health`
+
+Проверяет:
+
+- доступность PostgreSQL;
+- статус загруженной MLflow champion-модели;
+- текущий model alias/version.
+
+Пример:
+
+```bash
+curl -s http://127.0.0.1:8000/health | python3 -m json.tool
+```
+
+### 10.2. `/predict/station`
+
+Принимает station id и horizon, возвращает прогноз доступности.
+
+Пример:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/predict/station \
+  -H "Content-Type: application/json" \
+  -d '{"legacy_station_id":"6879.04","horizon_minutes":60}' \
+  | python3 -m json.tool
+```
+
+Endpoint возвращает:
 
 ```text
-202605-citibike-tripdata.zip появился на S3
-→ DAG скачал файл
-→ распарсил май
-→ скачал weather archive за май
-→ пересобрал delta features
-→ обучил candidate/challenger
-→ выполнил fair quality gate
+current_bikes
+current_docks
+capacity
+predicted_delta_bikes_1h
+predicted_bikes_raw
+predicted_bikes_clipped
+low_availability_risk
+stale_state
+model_name
+model_version
+mlflow_run_id
+weather_source
+predicted_at
+target_time
+prediction_log_id
+```
+
+### 10.3. `/predict/batch`
+
+Позволяет получить прогноз сразу для нескольких станций.
+
+### 10.4. `/metrics`
+
+Endpoint Prometheus metrics, добавленный через `prometheus-fastapi-instrumentator`.
+
+---
+
+## 11. Prediction logging и online-оценку прогнозов
+
+Каждый прогноз записывается в PostgreSQL:
+
+```text
+prediction_log
+```
+
+Таблица хранит:
+
+- prediction timestamp;
+- target timestamp;
+- station id and station name;
+- current bikes and docks;
+- predicted delta;
+- predicted bikes raw and clipped;
+- model version and MLflow run ID;
+- stale state flag;
+- actual later bikes and docks;
+- availability error;
+- evaluation timestamp.
+
+Online evaluation script:
+
+```text
+scripts/evaluate_prediction_log_online.py
+```
+
+Он сопоставляет созревшие прогнозы с фактическими future GBFS snapshots и обновляет:
+
+```text
+actual_bikes
+actual_docks
+availability_error
+evaluated_at
+```
+
+Эти данные используются в Grafana для модельного и бизнес-мониторинга.
+
+---
+
+## 12. CI/CD
+
+### 12.1. CI
+
+GitHub Actions workflow:
+
+```text
+.github/workflows/ci.yml
+```
+
+CI запускается на push и проверяет:
+
+- Python syntax для API, scripts и Airflow DAGs;
+- Docker Compose config;
+- наличие ключевых файлов.
+
+### 12.2. CD
+
+GitHub Actions workflow:
+
+```text
+.github/workflows/deploy.yml
+```
+
+Deploy запускается вручную:
+
+```text
+Actions → bikeml deploy → Run workflow
+```
+
+Используется self-hosted GitHub Actions runner на MLOps-сервере.
+
+Это позволяет выполнять deploy через GitHub Actions без открытия SSH для GitHub-hosted runners.
+
+Deploy workflow:
+
+- выполняет checkout repository;
+- синхронизирует код в `/home/deploy/mlops-stack`;
+- копирует monitoring config;
+- создаёт и готовит data directories для Prometheus/Grafana;
+- исправляет права на persistent monitoring volumes;
+- валидирует Python files и Docker Compose config;
+- пересобирает code images;
+- перезапускает API, Airflow и monitoring services;
+- проверяет `/health`, `/metrics`, Prometheus health и Grafana health.
+
+---
+
+## 13. Monitoring
+
+Проект включает полноценный Prometheus/Grafana monitoring stack.
+
+### 13.1. Monitoring components
+
+| Компонент | Роль |
+|---|---|
+| Prometheus | Сбор метрик |
+| Grafana | Dashboard |
+| prometheus-fastapi-instrumentator | FastAPI `/metrics` |
+| Blackbox exporter | HTTP health probes |
+| Node exporter | Метрики сервера |
+| cAdvisor | Метрики Docker containers |
+| Postgres exporter | Метрики PostgreSQL |
+
+### 13.2. Prometheus targets
+
+Prometheus scrapes:
+
+```text
+bikeml-api
+prometheus
+blackbox-http
+node-exporter
+cadvisor
+postgres-exporter
+```
+
+На странице Prometheus Targets все основные targets находятся в состоянии `UP`.
+
+### 13.3. Grafana dashboard
+
+Dashboard:
+
+```text
+BikeML MLOps Monitoring
+```
+
+Dashboard покрывает три уровня мониторинга.
+
+#### Технические / инфраструктурные метрики
+
+- all service probes healthy;
+- all Prometheus targets up;
+- PostgreSQL up;
+- server memory available;
+- API request rate;
+- API p95 latency;
+- top container memory usage;
+- top container CPU usage;
+- PostgreSQL active connections;
+- max scrape duration.
+
+#### Модельные метрики
+
+- latest offline MAE;
+- latest offline bias;
+- online availability MAE;
+- offline MAE history;
+- recent model evaluations.
+
+#### Бизнесовые / операционные метрики
+
+- logged predictions;
+- low availability risk count;
+- low availability risk share;
+- latest prediction age;
+- latest evaluation age;
+- evaluation coverage.
+
+### 13.4. Доступ к Grafana
+
+Grafana доступна для просмотра:
+
+```text
+http://128.140.1.182:3000
+```
+
+Anonymous access включён только с ролью:
+
+```text
+Viewer
+```
+
+Prometheus наружу не открыт и остаётся доступен через localhost/tunnel.
+
+Для локального доступа через SSH tunnel:
+
+```bash
+ssh -i ~/.ssh/id_ed25519_mlops_exam \
+  -L 3000:127.0.0.1:3000 \
+  -L 9090:127.0.0.1:9090 \
+  deploy@128.140.1.182
+```
+
+После открытия туннеля:
+
+```text
+Grafana:    http://127.0.0.1:3000
+Prometheus: http://127.0.0.1:9090
 ```
 
 ---
 
-## 9. Проверки
+## 14. SLI/SLO и управление рисками
+
+Документ:
+
+```text
+reports/sli_slo.md
+```
+
+SLI/SLO определены на трёх уровнях:
+
+### 14.1. Технический уровень
+
+Примеры:
+
+- `/health` success rate >= 99%;
+- `/predict/station` p95 latency <= 2 seconds;
+- GBFS data age <= 900 seconds;
+- Airflow DAG success rate >= 95%;
+- Prometheus targets up = 100%;
+- server memory available > 1 GB.
+
+### 14.2. Модельный уровень
+
+Примеры:
+
+- candidate MAE лучше baseline и проходит fair gate;
+- RMSE не растёт резко относительно champion;
+- `abs(bias_delta) <= 0.25`;
+- online MAE availability <= 5 bikes;
+- evaluation coverage >= 90% для mature predictions.
+
+### 14.3. Бизнес-уровень
+
+Примеры:
+
+- low availability share мониторится, critical threshold > 20%;
+- recall low availability >= 0.70;
+- stale prediction share <= 5%;
+- latest prediction age контролируется.
+
+---
+
+## 15. ADR / MDD latency decision
+
+Документ:
+
+```text
+adr/ADR-001-latency-serving-path.md
+```
+
+ADR содержит:
+
+- decision question;
+- H0/H1;
+- latency samples для `/predict/station` и `/health`;
+- descriptive statistics;
+- p95 latency;
+- Welch t-test;
+- Mann–Whitney U test;
+- p-value;
+- итоговое архитектурное решение.
+
+Ключевой вывод:
+
+```text
+/predict/station статистически медленнее /health,
+но observed p95 ≈ 0.055 sec намного ниже SLO p95 <= 2 sec.
+```
+
+`/health` используется как минимальная baseline-точка latency инфраструктуры. Тест показывает стоимость полного prediction path относительно лёгкой проверки. Поскольку даже полный путь намного быстрее SLO, кэширование погоды и отдельный слой отдачи фичей не блокируют MVP и оставлены как будущие улучшения.
+
+Поэтому текущий FastAPI serving path принят для MVP.
+
+---
+
+## 16. Переменные окружения
+
+Реальные секреты хранятся в `.env`, который не должен попадать в Git.
+
+Шаблон хранится в:
+
+```text
+.env.example
+```
+
+Ключевые переменные ingestion bridge:
+
+```env
+INGESTION_SSH_HOST=<OLD_INGESTION_SERVER_IP>
+INGESTION_SSH_USER=bikeml_ro
+INGESTION_RAW_PATH=/srv/bikeml/raw/gbfs
+INGESTION_SSH_KEY_PATH=/opt/airflow/.ssh/bikeml_ingestion_read
+UPSTREAM_FRESHNESS_MAX_AGE_MINUTES=30
+```
+
+Ключевые monitoring переменные:
+
+```env
+GRAFANA_ADMIN_USER=admin
+GRAFANA_ADMIN_PASSWORD=<secret>
+PROMETHEUS_DATA_DIR=/mnt/mlops-data/prometheus
+GRAFANA_DATA_DIR=/mnt/mlops-data/grafana
+```
+
+---
+
+## 17. Проверки
 
 ### Проверить контейнеры
 
@@ -381,103 +835,126 @@ LIMIT 10;
 "
 ```
 
----
+### Проверить FastAPI
 
-## 10. Доступ к UI
-
-UI-порты не открываются наружу. Доступ выполняется через SSH-туннель.
-
-Пример Windows PowerShell:
-
-```powershell
-ssh -i "$env:USERPROFILE\.ssh\id_ed25519_mlops_exam" `
-  -L 8080:127.0.0.1:8080 `
-  -L 5000:127.0.0.1:5000 `
-  -L 9001:127.0.0.1:9001 `
-  deploy@<MLOPS_SERVER_IP>
+```bash
+curl -s http://127.0.0.1:8000/health | python3 -m json.tool
 ```
 
-После открытия туннеля:
+```bash
+curl -s http://127.0.0.1:8000/metrics | head
+```
 
-```text
-Airflow: http://127.0.0.1:8080
-MLflow:  http://127.0.0.1:5000
-MinIO:   http://127.0.0.1:9001
+### Проверить Prometheus / Grafana
+
+```bash
+curl -s http://127.0.0.1:9090/-/healthy
+curl -s http://127.0.0.1:3000/api/health
 ```
 
 ---
 
-## 11. Переменные окружения
+## 18. Teardown / деинсталляция
 
-Реальные секреты хранятся в `.env`, который не должен попадать в Git.
+Перед удалением инфраструктуры желательно остановить self-hosted GitHub Actions runner, чтобы в GitHub не остался висящий offline-runner.
 
-Шаблон хранится в:
+На MLOps-сервере:
 
-```text
-.env.example
+```bash
+cd ~/actions-runner
+sudo ./svc.sh stop
+sudo ./svc.sh uninstall
 ```
 
-Ключевые переменные ingestion bridge:
+Если нужно полностью разрегистрировать runner в GitHub:
 
-```env
-INGESTION_SSH_HOST=<OLD_INGESTION_SERVER_IP>
-INGESTION_SSH_USER=bikeml_ro
-INGESTION_RAW_PATH=/srv/bikeml/raw/gbfs
-INGESTION_SSH_KEY_PATH=/opt/airflow/.ssh/bikeml_ingestion_read
-UPSTREAM_FRESHNESS_MAX_AGE_MINUTES=30
+```bash
+./config.sh remove --token <GITHUB_RUNNER_REMOVE_TOKEN>
 ```
+
+После этого можно удалить Terraform-инфраструктуру с локальной машины из папки Terraform:
+
+```bash
+terraform destroy
+```
+
+Важно:
+
+- `terraform destroy` удаляет MLOps-сервер и volume, созданные Terraform;
+- Persistent Raw Ingestion Server не управляется Terraform и не удаляется;
+- raw GBFS snapshots на старом ingestion-сервере сохраняются;
+- если runner не разрегистрировать заранее, его можно удалить вручную в GitHub: `Settings → Actions → Runners`.
 
 ---
 
-## 12. Known limitations
+## 19. Known limitations
 
 Ограничения MVP:
 
-1. FastAPI serving layer находится в работе.
-2. Full Feast implementation вынесен в stretch; MVP использует feature tables в PostgreSQL.
-3. Great Expectations, Evidently, Prometheus/Grafana вынесены в stretch.
-4. Ребалансировка не моделируется, так как нет данных о действиях оператора.
-5. Погода в train берётся из archive API, а в inference будет использовать forecast API.
-6. Production SLA, multi-region и отказоустойчивость коммерческого уровня не входят в MVP.
+1. Feast feature store вынесен в stretch; MVP использует feature tables в PostgreSQL.
+2. Evidently drift reports и automatic alerting не реализованы.
+3. Ребалансировка не моделируется, так как нет данных о действиях оператора.
+4. Погода в train берётся из archive API, а в inference используется forecast/fallback logic.
+5. Production SLA, multi-region и отказоустойчивость коммерческого уровня не входят в MVP.
+6. Anonymous Grafana access включён для проверки и должен быть отключён после проверки.
 
 ---
 
-## 13. Следующие шаги
+## 20. Текущий статус
 
-Ближайший порядок работ:
-
-1. Зафиксировать текущий checkpoint в Git.
-2. Реализовать FastAPI:
-   - `GET /health`;
-   - `POST /predict/station`;
-   - `POST /predict/batch`.
-3. Добавить запись прогнозов в `prediction_log` с `target_time = predicted_at + 1 hour`.
-4. Реализовать online evaluation: сравнение прогнозов с фактическими GBFS snapshots через час.
-5. Подготовить `reports/sli_slo.md` с SLI/SLO на техническом, модельном и бизнес-уровнях.
-6. Подготовить ADR по latency с H0/H1, статистическим тестом и p-value.
-7. Добавить минимальный GitHub Actions workflow.
-8. Финально проверить `/health`, Airflow DAGs, MLflow aliases, teardown-инструкцию.
-
----
-
-## 14. Terraform infrastructure note
-
-Инфраструктура MLOps-сервера создана через Terraform в Hetzner Cloud.
-
-Terraform отвечает за:
-
-- создание нового сервера;
-- firewall;
-- SSH key;
-- volume;
-- базовую подготовку сервера через cloud-init.
-
-Docker Compose отвечает за runtime-стек сервисов внутри уже созданного сервера.
-
-Старый Persistent Raw Ingestion Server не импортируется в Terraform и не управляется через него. Он остаётся отдельным постоянным raw ingestion сервером.
-
-Подробное описание Terraform-конфигурации находится в:
+Реализовано:
 
 ```text
-terraform/README.md
+Terraform provisioning
+Docker Compose MLOps stack
+PostgreSQL / MinIO / MLflow / Airflow / Redis
+GBFS ingestion bridge
+structured GBFS layer
+station_id_mapping
+monthly tripdata ingestion
+automatic pickup of new monthly CSV
+weather archive ingestion
+delta feature engineering
+LightGBM weather model
+XGBoost weather challenger
+MLflow champion/candidate/challenger aliases
+fair quality gate with champion re-evaluation
+FastAPI serving
+prediction_log
+online prediction evaluation
+Prometheus/Grafana monitoring
+technical/model/business Grafana dashboard
+SLI/SLO documentation
+ADR/MDD latency decision with statistical test
+GitHub Actions CI
+GitHub Actions CD through self-hosted runner
 ```
+
+Подтверждён живой ежемесячное переобучение scenario:
+
+```text
+202605-citibike-tripdata.zip появился на S3
+→ DAG скачал файл
+→ распарсил май
+→ скачал weather archive за май
+→ пересобрал delta features
+→ обучил candidate/challenger
+→ выполнил fair quality gate
+```
+
+Проект демонстрирует MLOps maturity level 2: автоматизированный pipeline, registry, quality gate, serving, logging, monitoring, CI/CD и документированные SLI/SLO/ADR.
+
+---
+
+## 21. Возможные дальнейшие улучшения
+
+Возможные расширения после MVP:
+
+1. Feast feature store integration;
+2. автоматическое provisioning Grafana dashboard из JSON;
+3. Nginx reverse proxy with TLS;
+4. Prometheus/Grafana alerting rules;
+5. Evidently drift reports;
+6. более подробные бизнес-KPI для операционных решений по ребалансировке;
+7. оптимизированный batch inference;
+8. кэширование прогноза погоды.
