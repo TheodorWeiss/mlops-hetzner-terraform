@@ -6,7 +6,7 @@
 **Инфраструктура:** Hetzner Cloud (новый сервер, провижен через Terraform) + существующий сервер для сбора raw-данных.
 **Репозиторий инфраструктуры:** github.com/TheodorWeiss/mlops-hetzner-terraform
 **Дата:** июнь 2026.
-**Статус документа:** финальный срез перед защитой. Раздел 4 отражает фактически реализованные компоненты; то, что осталось в stretch (Feast, Evidently/GX, алертинг, Nginx), помечено явно и при доработке будет повышено.
+**Статус документа:** финальный срез перед защитой. Раздел 4 отражает фактически реализованные компоненты; то, что осталось в stretch (Feast, Evidently/GX, алертинг, TLS/HTTPS для nginx), помечено явно.
 
 ---
 
@@ -77,20 +77,20 @@
 - Эксперименты/реестр: **MLflow** (tracking + model registry, alias champion/challenger)
 - Feature store: **feature-таблицы в Postgres**, привязанные к временным окнам и source month; полноценный feature-store/versioning через Feast — stretch
 - Storage: **Postgres** (mapping, feature tables, prediction logs, eval runs) + **MinIO** (raw, parquet, models, reports)
-- Сервинг: **FastAPI** (`/health`, `/predict/station`, `/predict/batch`)
-- Мониторинг: **Prometheus + Grafana** (дашборд «BikeML MLOps Monitoring» на 3 уровнях: технический/модельный/бизнес; экспортёры node/cadvisor/postgres/blackbox + FastAPI `/metrics`) + **`model_evaluation_runs` + `prediction_log` + online-оценка** + `check_upstream_freshness`; read-only доступ: http://128.140.1.182:3000/d/cfo5yiooy17uoc/bikeml-mlops-monitoring
+- Сервинг: **nginx reverse proxy на HTTP port 80** как единственная публичная точка входа + **FastAPI** (`/health`, `/predict/station`, `/predict/batch`) внутри сервера
+- Мониторинг: **Prometheus + Grafana** (дашборд «BikeML MLOps Monitoring» на 3 уровнях: технический/модельный/бизнес; экспортёры node/cadvisor/postgres/blackbox + FastAPI `/metrics`) + **`model_evaluation_runs` + `prediction_log` + online-оценка** + `check_upstream_freshness`; доступ к Grafana: через SSH-туннель на `127.0.0.1:3000`; anonymous access отключён
 - CI/CD: **GitHub Actions** (CI на push + ручной CD через self-hosted runner на сервере)
 - IaC: **Terraform** (провижен сервера/firewall/volume) + **docker-compose** (стек)
 - Базовый Data Quality: проверки в парсерах (флаги, `last_reported`, аномалии поездок) с записью DQ-счётчиков в лог-таблицы
 
-Статус: **реализовано** — Terraform/docker-compose, Airflow (ingestion-bridge + monthly retraining DAG), MLflow (registry + champion/candidate/challenger), Postgres, MinIO, structured-слой, ingestion-bridge, feature engineering, production-модель (LightGBM delta + weather) и XGBoost-челленджер, **честный quality gate с переоценкой champion на новом тест-месяце**, **FastAPI** (`/health`, `/predict/station`, `/predict/batch`, `/metrics`), **prediction_log + online-оценка**, **CI/CD (GitHub Actions + self-hosted runner)**, **Prometheus/Grafana мониторинг на 3 уровнях (дашборд: http://128.140.1.182:3000/d/cfo5yiooy17uoc/bikeml-mlops-monitoring)**, **`reports/sli_slo.md`** и **`adr/ADR-001-latency-serving-path.md`**. Подтверждён живой сценарий автоподхвата нового месячного CSV (202605) и переобучения. **В работе / stretch** — Feast, Evidently drift-reports, автоматический алертинг, выделенные Grafana-панели precision/recall low-availability (по мере накопления положительных случаев), Nginx.
+Статус: **реализовано** — Terraform/docker-compose, Airflow (ingestion-bridge + monthly retraining DAG), MLflow (registry + champion/candidate/challenger), Postgres, MinIO, structured-слой, ingestion-bridge, feature engineering, production-модель (LightGBM delta + weather) и XGBoost-челленджер, **честный quality gate с переоценкой champion на новом тест-месяце**, **nginx reverse proxy на HTTP port 80**, **FastAPI** (`/health`, `/predict/station`, `/predict/batch`, `/metrics`), **prediction_log + online-оценка**, **CI/CD (GitHub Actions + self-hosted runner)**, **Prometheus/Grafana мониторинг на 3 уровнях (Grafana доступна через SSH-туннель на `127.0.0.1:3000`, anonymous access отключён)**, **`reports/sli_slo.md`** и **`adr/ADR-001-latency-serving-path.md`**. Подтверждён живой сценарий автоподхвата нового месячного CSV (202605) и переобучения. **В работе / stretch** — Feast, Evidently drift-reports, автоматический алертинг, выделенные Grafana-панели precision/recall low-availability (по мере накопления положительных случаев), TLS/HTTPS для nginx.
 
 *Stretch (строим по остатку времени; не заявляются как готовые, пока не работают):*
 - **Feast** как полноценный feature-store-адаптер поверх Postgres feature tables
 - **Great Expectations** — формализация DQ-проверок в suite
 - **Evidently** — drift/quality HTML-отчёты в MinIO
 - **Автоматический алертинг** (Prometheus/Grafana alert rules; сейчас мониторинг есть, алертинг — нет)
-- **Nginx** reverse proxy с TLS
+- **TLS/HTTPS для nginx**; в MVP реализован nginx reverse proxy на HTTP port 80
 - Выделенные Grafana-панели precision/recall low-availability (после накопления положительных случаев)
 - **Superset** (BI-кабинет оператора), **OpenMetadata/DataHub** (data catalog) — явно вне scope MVP
 
@@ -113,7 +113,7 @@
 - «Live»-демонстрация автоцикла переобучения опирается на реальное ежемесячное появление нового CSV (подтверждено на практике).
 
 **Что НЕ входит в продукт:**
-- Графовые нейросети / SOTA spatiotemporal модели.
+- Сложные пространственно-временные модели и отдельная модель графа станций.
 - Прогноз на горизонты >60 минут и мульти-день.
 - Моделирование ребалансировки и маршрутизации грузовиков.
 - Отдельный прогноз риска переполнения доков (возможное расширение).
@@ -142,7 +142,7 @@
 - *Качество/свежесть live-данных* → DQ-проверки в парсерах + `check_upstream_freshness` (чтение `collector_status.json` + возраст снепшота) + флаг `stale_state` в ответах API.
 - *Несовпадение станций CSV↔GBFS* → снят через `station_id_mapping` (coverage 1.0000).
 
-**Текущий статус реализации (финальный срез).** Провижена инфраструктура (Terraform), поднят стек (Postgres/MinIO/MLflow/Airflow), работают оба DAG (ingestion-bridge + monthly retraining), structured-слой GBFS, historical trip ingestion (фев–май, автоподхват 202605 подтверждён), feature engineering, production-модель + челленджер в MLflow, честный quality gate, FastAPI (`/health`, `/predict`, `/metrics`), prediction_log + online-оценка, CI/CD (GitHub Actions + self-hosted runner), Prometheus/Grafana на 3 уровнях, `sli_slo.md` и `ADR-001-latency.md`. В работе / stretch: Feast, Evidently, алертинг, Nginx.
+**Текущий статус реализации (финальный срез).** Провижена инфраструктура (Terraform), поднят стек (Postgres/MinIO/MLflow/Airflow), работают оба DAG (ingestion-bridge + monthly retraining), structured-слой GBFS, historical trip ingestion (фев–май, автоподхват 202605 подтверждён), feature engineering, production-модель + челленджер в MLflow, честный quality gate, nginx reverse proxy на HTTP port 80, FastAPI (`/health`, `/predict`, `/metrics`), prediction_log + online-оценка, CI/CD (GitHub Actions + self-hosted runner), Prometheus/Grafana на 3 уровнях, `sli_slo.md` и `ADR-001-latency.md`. В работе / stretch: Feast, Evidently, алертинг, TLS/HTTPS для nginx.
 
 ## 6. Данные
 
@@ -269,7 +269,7 @@ Target — `delta_bikes_1h`.
 
 **Конечные результаты (deliverables):**
 - Репозиторий: код + текстовые артефакты — `MANIFEST.md`, диаграмма архитектуры, `reports/sli_slo.md` (SLI/SLO на 3 уровнях с порогами), `adr/ADR-001-latency-serving-path.md` (статтест по latency), инструкция teardown.
-- Развёрнутый в облаке работающий сервис (`/health`=200, `docker ps` healthy), живой до защиты; Grafana-дашборд мониторинга: http://128.140.1.182:3000/d/cfo5yiooy17uoc/bikeml-mlops-monitoring.
+- Развёрнутый в облаке работающий сервис (`/health`=200 через nginx, `docker ps` healthy), живой до защиты; Grafana-дашборд мониторинга доступен через SSH-туннель на `127.0.0.1:3000`, anonymous access отключён.
 - CI/CD: GitHub Actions (CI на push + ручной CD через self-hosted runner).
 - Воспроизводимая инфраструктура (Terraform + docker-compose; `terraform destroy` для teardown; перед destroy — разрегистрация self-hosted runner).
 - Демонстрация полного цикла: данные → обучение → оценка → честный quality gate (переоценка champion) → promotion/rollback через MLflow-alias; живой пример автоподхвата нового месячного CSV (202605) и переобучения.

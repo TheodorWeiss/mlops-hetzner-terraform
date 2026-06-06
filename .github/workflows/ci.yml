@@ -23,7 +23,7 @@ jobs:
         run: |
           cat > .env <<'EOF'
           POSTGRES_USER=bikeml_admin
-          POSTGRES_PASSWORD=bikeml_password
+          POSTGRES_PASSWORD=${{ secrets.CI_POSTGRES_PASSWORD }}
           POSTGRES_DB=postgres
           AIRFLOW_DB=airflow
           MLFLOW_DB=mlflow
@@ -35,8 +35,8 @@ jobs:
           INCOMING_RAW_DIR=/tmp/bikeml/incoming-raw
           PROCESSED_DATA_DIR=/tmp/bikeml/processed-data
 
-          MINIO_ROOT_USER=minioadmin
-          MINIO_ROOT_PASSWORD=minioadmin
+          MINIO_ROOT_USER=${{ secrets.CI_MINIO_ROOT_USER }} 
+          MINIO_ROOT_PASSWORD=${{ secrets.CI_MINIO_ROOT_PASSWORD }}
           MINIO_BUCKET_RAW=bikeml-raw
           MINIO_BUCKET_PROCESSED=bikeml-processed
           MINIO_BUCKET_MODELS=bikeml-models
@@ -44,11 +44,11 @@ jobs:
 
           MLFLOW_S3_ENDPOINT_URL=http://minio:9000
           MLFLOW_ARTIFACT_BUCKET=bikeml-models
-          AWS_ACCESS_KEY_ID=minioadmin
-          AWS_SECRET_ACCESS_KEY=minioadmin
+          AWS_ACCESS_KEY_ID=${{ secrets.CI_AWS_ACCESS_KEY_ID }} 
+          AWS_SECRET_ACCESS_KEY=${{ secrets.CI_AWS_SECRET_ACCESS_KEY }}
 
-          AIRFLOW_ADMIN_USER=admin
-          AIRFLOW_ADMIN_PASSWORD=admin
+          AIRFLOW_ADMIN_USER=${{ secrets.CI_AIRFLOW_ADMIN_USER }} 
+          AIRFLOW_ADMIN_PASSWORD=${{ secrets.CI_AIRFLOW_ADMIN_PASSWORD }}
           AIRFLOW_ADMIN_EMAIL=admin@example.com
 
           INGESTION_SSH_HOST=example.com

@@ -90,3 +90,81 @@ Firewall настроен минимально:
 /mnt/mlops-data/grafana
 /mnt/mlops-data/processed-data
 /mnt/mlops-data/incoming-raw
+```
+
+## После `terraform apply`
+
+После успешного выполнения `terraform apply` Terraform создаёт сервер, firewall, SSH-ключ и volume, а `cloud-init` выполняет только базовую подготовку операционной системы и Docker-окружения.
+
+`cloud-init` не клонирует репозиторий, не создаёт production `.env`, не запускает Docker Compose стек и не регистрирует GitHub self-hosted runner. Эти шаги выполняются отдельно, чтобы секреты и deployment-логика не хранились в Terraform-коде.
+
+Рекомендуемый порядок действий после создания инфраструктуры:
+
+1. Подключиться к серверу по SSH:
+
+   ```bash
+   ssh deploy@128.140.1.182
+   ```
+
+
+2. Проверить результат работы `cloud-init` уже на сервере:
+
+   ```bash
+   cat /home/deploy/cloud-init-checks.txt
+   ```
+
+3. Подготовить production `.env` из `.env.example` и заполнить реальные значения секретов только на сервере или через GitHub Secrets.
+
+4. Установить или проверить GitHub self-hosted runner.
+
+5. Запустить deploy workflow или вручную поднять стек через Docker Compose.
+
+6. Проверить публичный health endpoint через nginx:
+
+   ```bash
+   curl http://128.140.1.182/health
+   ```
+
+Публичная prediction-точка входа: `POST http://128.140.1.182/api/predict/station`.
+
+В финальной схеме доступа nginx является единственной публичной точкой входа на порту `80`. FastAPI напрямую доступен только локально на сервере через `127.0.0.1:8000`. Grafana доступна только через SSH-туннель на `127.0.0.1:3000`, anonymous access отключён. PostgreSQL не имеет host port mapping в Docker Compose и не публикуется наружу.
+
+## Деинсталляция / завершение работы
+
+Перед удалением инфраструктуры нужно учитывать, что Terraform удаляет только те ресурсы, которые описаны в этой Terraform-конфигурации: новый MLOps-сервер, firewall, SSH key, volume и attachment volume. Старый ingestion-сервер, который собирает первичные raw-данные, этой Terraform-конфигурацией не управляется и при `terraform destroy` не удаляется.
+
+Перед удалением сервера рекомендуется сделать backup важных данных из `/mnt/mlops-data`: данных PostgreSQL, артефактов MLflow, данных MinIO, Grafana dashboards и отчётов.
+
+Рекомендуемый порядок завершения работы:
+
+1. Подключиться к серверу и остановить Docker Compose стек:
+
+   ```bash
+   ssh deploy@128.140.1.182
+   cd /opt/bikeml
+   docker compose -p bikeml down
+   ```
+
+2. Если нужно удалить также Docker volumes приложения, использовать вариант:
+
+   ```bash
+   docker compose -p bikeml down -v
+   ```
+
+   Этот шаг удаляет Docker volumes, созданные compose-проектом. Данные на отдельном Hetzner volume нужно проверять отдельно.
+
+3. Остановить и удалить GitHub self-hosted runner с сервера, чтобы в GitHub не остался неактивный runner.
+
+4. В локальной папке Terraform проверить план удаления:
+
+   ```bash
+   terraform plan -destroy
+   ```
+
+5. Удалить инфраструктуру:
+
+   ```bash
+   terraform destroy
+   ```
+
+После `terraform destroy` новый MLOps-сервер и управляемые Terraform ресурсы будут удалены. Старый ingestion-сервер и внешние данные, не описанные в Terraform state, останутся без изменений.

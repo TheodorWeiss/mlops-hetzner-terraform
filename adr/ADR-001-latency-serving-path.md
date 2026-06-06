@@ -8,7 +8,7 @@
 
 ## Контекст
 
-BikeML — учебный MLOps-проект для прогнозирования доступности велосипедов на станциях Citi Bike на горизонте 1 час.
+BikeML - учебный MLOps-проект для прогнозирования доступности велосипедов на станциях Citi Bike на горизонте 1 час.
 
 Serving API предоставляет endpoints:
 
@@ -18,6 +18,25 @@ POST /predict/station
 POST /predict/batch
 GET  /metrics
 ```
+
+В публичной схеме доступа запросы идут через nginx:
+
+```text
+Internet
+-> nginx, port 80
+-> FastAPI
+```
+
+Публичные endpoints для MVP:
+
+```text
+GET  http://128.140.1.182/health
+POST http://128.140.1.182/api/predict/station
+```
+
+Endpoint `/api/predict/station` на nginx проксируется во внутренний FastAPI endpoint `/predict/station`.
+
+FastAPI напрямую наружу не открыт. Прямой доступ к приложению используется только локально на сервере через `127.0.0.1:8000`.
 
 Основной prediction endpoint строит итоговый прогноз так:
 
@@ -36,52 +55,60 @@ Endpoint `/predict/station` выполняет полный production-like pred
 6. записывает запрос и прогноз в `prediction_log`;
 7. возвращает прогноз и operational flags.
 
-Endpoint `/health` является лёгким техническим endpoint. Он проверяет доступность базы данных и статус загрузки модели, но не выполняет полный prediction path.
+Endpoint `/health` является лёгким техническим endpoint. Он нужен для проверки доступности сервиса, базы данных и статуса загрузки модели. Он не выполняет полный prediction path и не является бизнес-альтернативой endpoint `/predict/station`.
 
-Для MVP нужно решить, приемлема ли latency полного prediction path или необходимо сначала переработать API: убрать внешние вызовы, сильнее кэшировать weather features или вводить отдельный feature-serving слой.
+Для MVP нужно решить, приемлема ли latency полного prediction path или перед релизом нужно менять serving architecture: сильнее кэшировать weather features, убирать внешние вызовы или вводить отдельный feature-serving слой.
 
 ---
 
 ## Вопрос архитектурного решения
 
-Принимаем ли текущий полный prediction path для MVP serving или нужно сначала redesign API для уменьшения latency?
+Можно ли оставить текущий полный prediction path для MVP serving при заданном latency SLO?
+
+MVP SLO для prediction latency:
+
+```text
+p95 latency <= 2 seconds
+```
 
 ---
 
-## Гипотезы
+## Гипотезы и критерий принятия решения
+
+В этой версии ADR архитектурное решение принимается не по сравнению с `/health`, а по соответствию prediction endpoint принятому SLO.
 
 ### Нулевая гипотеза H0
 
-Полный prediction path не имеет большей latency, чем лёгкий health endpoint.
+Полный prediction path не укладывается в latency SLO.
 
 ```text
-H0: latency_predict <= latency_health
+H0: p95(predict) >= 2.0 sec
 ```
 
 ### Альтернативная гипотеза H1
 
-Полный prediction path имеет большую latency, чем лёгкий health endpoint.
+Полный prediction path укладывается в latency SLO.
 
 ```text
-H1: latency_predict > latency_health
+H1: p95(predict) < 2.0 sec
 ```
 
-Ожидается, что `/predict/station` будет медленнее, потому что он выполняет чтение features, model inference и запись в `prediction_log`, тогда как `/health` выполняет только лёгкие проверки.
+Для учебного MVP используется практическое one-sided decision rule:
 
-### Почему baseline сравнивается с `/health`
+```text
+если наблюдаемый p95 для /predict/station меньше 2 секунд с большим запасом,
+то текущий serving path принимается для MVP.
+```
 
-В этом ADR `/health` используется не как полноценная альтернатива бизнес-serving, а как минимальная baseline-точка latency инфраструктуры: FastAPI, сеть внутри сервера, базовая проверка БД и статуса модели.
-
-Разница между `/predict/station` и `/health` показывает дополнительную стоимость полного prediction path: чтения online features, подготовки признаков, model inference и записи в `prediction_log`.
-
-Для MVP этого достаточно для архитектурного решения: если даже полный prediction path значительно быстрее SLO, то дополнительные оптимизации вроде кэширования погоды, предварительного расчёта фичей или отдельного feature-serving слоя не блокируют релиз MVP и переносятся в future improvements.
-
+Endpoint `/health` остаётся в ADR только как diagnostic baseline. Он показывает нижнюю границу технической latency приложения, но не является объектом архитектурного решения.
 
 ---
 
 ## Сбор данных
 
 Latency измерялась локально на MLOps-сервере с помощью `curl`.
+
+Замеры выполнялись на FastAPI port `127.0.0.1:8000`, то есть напрямую на приложении, без публичного nginx path. Для данного решения это допустимо: nginx добавляет небольшой локальный proxy-overhead, а наблюдаемая latency prediction endpoint имеет очень большой запас относительно SLO `2 sec`.
 
 ### Prediction endpoint
 
@@ -185,58 +212,63 @@ Samples, seconds:
 
 ## Описательная статистика
 
-| Endpoint | n | Mean, sec | Median, sec | p95, sec | Max, sec |
-|---|---:|---:|---:|---:|---:|
-| `/predict/station` | 30 | 0.0449 | 0.0430 | 0.0551 | 0.0600 |
-| `/health` | 30 | 0.0079 | 0.0071 | 0.0122 | 0.0142 |
+| Endpoint           |  n | Mean, sec | Median, sec | p95, sec | Max, sec |
+| ------------------ | -: | --------: | ----------: | -------: | -------: |
+| `/predict/station` | 30 |    0.0449 |      0.0430 |   0.0551 |   0.0600 |
+| `/health`          | 30 |    0.0079 |      0.0071 |   0.0122 |   0.0142 |
 
-Полный prediction path медленнее `/health`, но абсолютная latency остаётся низкой.
-
-MVP SLO для prediction latency:
+Наблюдаемый результат для основного prediction endpoint:
 
 ```text
-p95 latency <= 2 seconds
+/predict/station p95 latency ≈ 0.055 sec
 ```
 
-Наблюдаемый результат:
+Принятый SLO:
 
 ```text
-/predict/station p95 latency ≈ 0.055 seconds
+p95 latency <= 2 sec
 ```
 
-Это намного ниже SLO-порога.
+Запас относительно SLO:
+
+```text
+2.0 / 0.055 ≈ 36x
+```
+
+Даже максимальное наблюдение в выборке остаётся намного ниже SLO:
+
+```text
+max observed latency ≈ 0.060 sec
+```
 
 ---
 
-## Статистический тест
+## Диагностическое сравнение с `/health`
 
-Использованы два статистических теста:
+Дополнительно были выполнены два теста для сравнения `/predict/station` и `/health`:
 
 1. Welch's t-test для сравнения средних;
-2. Mann–Whitney U test как непараметрическая проверка устойчивости результата.
+2. Mann-Whitney U test как непараметрическая проверка.
 
 Результаты:
 
 ```text
 Welch t-test p-value ≈ 9.85e-24
 Mann-Whitney U test p-value ≈ 1.51e-11
-```
-
-Уровень значимости:
-
-```text
 alpha = 0.05
 ```
 
-Оба теста отвергают H0.
+Эти тесты показывают, что полный prediction path статистически значимо медленнее лёгкого `/health`.
+
+Это ожидаемый результат и сам по себе не является проблемой. `/health` не читает полный набор features, не выполняет полноценный inference path и не записывает прогноз в `prediction_log`.
+
+Поэтому сравнение с `/health` используется только как диагностика дополнительной стоимости prediction path. Архитектурное решение принимается по SLO для `/predict/station`.
 
 ---
 
 ## Интерпретация
 
-Полный prediction path статистически значимо медленнее лёгкого `/health` endpoint.
-
-Это ожидаемо и само по себе не является проблемой. Главный архитектурный вопрос: нарушает ли эта большая latency serving SLO.
+Главный вопрос ADR: нарушает ли полный prediction path latency SLO для MVP?
 
 Ответ: нет.
 
@@ -245,31 +277,67 @@ observed p95 ≈ 0.055 sec
 SLO p95 <= 2 sec
 ```
 
-Наблюдаемая latency prediction endpoint намного ниже принятого порога для MVP.
+Наблюдаемая p95 latency примерно в 36 раз ниже принятого SLO. Поэтому на текущем этапе нет необходимости блокировать MVP из-за отдельного feature-serving слоя, предварительного расчёта всех weather features или дополнительного кэширования.
+
+При этом результат не означает, что оптимизация больше не нужна никогда. Он означает только то, что для MVP текущий serving path достаточно быстрый и понятный.
 
 ---
 
 ## Решение
 
-Для MVP принимается текущая FastAPI serving architecture:
+Для MVP принимается текущая serving architecture:
 
 ```text
 client request
-→ FastAPI
-→ PostgreSQL online features
-→ признаки прогноза погоды
-→ MLflow @champion model
-→ prediction_log
-→ response
+-> nginx
+-> FastAPI
+-> PostgreSQL online features
+-> weather features
+-> MLflow @champion model
+-> prediction_log
+-> response
 ```
 
 Решение:
 
 ```text
 Сохранить текущий полный prediction path для MVP.
-Не блокировать проект из-за weather caching или отдельного слой отдачи фичей.
-Отслеживать latency как SLI и рассматривать caching как future optimization.
+Считать latency /predict/station соответствующей MVP SLO.
+Не блокировать MVP из-за weather caching или отдельного feature-serving слоя.
+Отслеживать latency как SLI в Prometheus/Grafana.
 ```
+
+Переключение модели в production path выполняется через MLflow model alias `@champion`. Это позволяет заменить активную модель без изменения публичного API endpoint.
+
+---
+
+## Trigger rule после MVP
+
+После запуска monitoring stack latency decision поддерживается live-метриками:
+
+```text
+FastAPI /metrics
+Prometheus scrape job bikeml-api
+Grafana panel api p95 latency
+Grafana panel api request rate
+```
+
+Если p95 latency для prediction endpoint на скользящем окне превышает MVP SLO, нужно активировать optimisation plan.
+
+Базовое правило:
+
+```text
+если p95 latency /predict/station > 2 sec на скользящем окне мониторинга,
+то текущий serving path больше не считается достаточным и требуется оптимизация.
+```
+
+Возможные меры:
+
+1. кэшировать weather forecast values;
+2. предварительно рассчитывать weather features на несколько часов вперёд;
+3. вынести online features в отдельный feature-serving слой;
+4. оптимизировать batch inference через единый DataFrame;
+5. проверить MLflow model loading и Python dependency mismatch warnings.
 
 ---
 
@@ -277,18 +345,19 @@ client request
 
 ### Положительные последствия
 
-- Serving layer остаётся простым и понятным.
-- API использует тот же feature contract, что и модель.
-- Endpoint уже записывает прогнозы в `prediction_log`.
-- Наблюдаемая latency намного ниже MVP SLO.
-- Архитектура достаточна для демонстрации MLOps maturity level 2.
+* Serving layer остаётся простым и понятным.
+* API использует тот же feature contract, что и модель.
+* Endpoint записывает прогнозы в `prediction_log`.
+* Наблюдаемая latency намного ниже MVP SLO.
+* Архитектура достаточна для демонстрации MLOps maturity level 2.
+* nginx становится единственной публичной точкой входа, а FastAPI не открыт напрямую наружу.
 
 ### Отрицательные последствия
 
-- `/predict/station` зависит от weather forecast logic.
-- Если внешний weather API будет медленным или недоступным, latency может вырасти.
-- Batch endpoint сейчас вызывает station prediction последовательно и не оптимизирован.
-- Dependency mismatch warnings от MLflow environment желательно устранить позже.
+* `/predict/station` зависит от weather forecast logic.
+* Если внешний weather API будет медленным или недоступным, latency может вырасти.
+* Batch endpoint сейчас вызывает station prediction последовательно и не оптимизирован.
+* Dependency mismatch warnings от MLflow environment желательно устранить позже.
 
 ### Снижение рисков
 
@@ -300,33 +369,19 @@ weather_source = fallback_neutral_weather
 
 Если внешний forecast call не срабатывает, endpoint может вернуть прогноз с нейтральными weather values.
 
-Будущие улучшения:
-
-1. кэшировать Open-Meteo forecast values;
-2. предварительно рассчитывать weather features на несколько часов вперёд;
-3. оптимизировать batch inference через единый DataFrame;
-4. выровнять API Python dependencies с MLflow model dependencies;
-5. добавить alerting rules для latency в Prometheus/Grafana.
-
----
-
-## Мониторинг после принятия решения
-
-После реализации monitoring stack latency decision поддерживается live-метриками:
-
-```text
-FastAPI /metrics
-Prometheus scrape job bikeml-api
-Grafana panel api p95 latency
-Grafana panel api request rate
-```
-
-Таким образом, latency больше не является только разовым экспериментом: она отслеживается как технический SLI в Grafana dashboard.
+Кроме того, после MVP latency контролируется через Prometheus/Grafana. Если p95 latency начнёт приближаться к SLO, оптимизация serving path станет обязательной задачей, а не просто future improvement.
 
 ---
 
 ## Финальный вывод
 
-Latency experiment показывает, что полный prediction endpoint статистически медленнее лёгкого `/health`, но его абсолютная latency остаётся намного ниже MVP SLO.
+Latency experiment показывает, что полный prediction endpoint ожидаемо медленнее лёгкого `/health`, но это не является основанием для redesign.
 
-Поэтому текущий FastAPI serving path принимается для MVP, а weather caching и оптимизированный batch inference задокументированы как будущие улучшения.
+Архитектурное решение принимается по SLO для `/predict/station`:
+
+```text
+observed p95 ≈ 0.055 sec
+SLO p95 <= 2 sec
+```
+
+С учётом большого запаса относительно SLO текущий FastAPI serving path через nginx принимается для MVP. Weather caching, отдельный feature-serving слой и оптимизированный batch inference остаются задокументированными улучшениями на случай роста latency или нагрузки.
